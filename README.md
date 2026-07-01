@@ -37,14 +37,14 @@ The defaults are:
 poll = 30
 root = ".tinycd"
 interlock = ".tinycd/interlock"
-sync = 'git clone --depth 1 "$TINYCD_REPO" .'
-install = "true"
+shell = ["sh", "-c"]                          # ["cmd", "/C"] on Windows
+sync = 'git clone --depth 1 "$TINYCD_REPO" .' # "%TINYCD_REPO%" on Windows
 keep = 5
 ```
 
-`repo` defaults to the current Git project's `origin`. `hook` is disabled by
-default. `start` has no default because guessing how to launch an arbitrary
-project would be unsafe.
+`repo` defaults to the current Git project's `origin`. `hook` and `install`
+are disabled by default. `start` has no default because guessing how to launch
+an arbitrary project would be unsafe.
 
 ## Configuration
 
@@ -56,18 +56,36 @@ poll = 30
 hook = "127.0.0.1:8080"
 root = ".tinycd"
 interlock = ".tinycd/interlock"
+shell = ["sh", "-c"]
 sync = 'git clone --depth 1 "$TINYCD_REPO" .'
 install = "npm ci"
 start = "npm start"
 keep = 5
+
+[env] # keep this table last: keys below a table header belong to it
+PYTHONPATH = "/home/me/code"
 ```
 
 See [tinycd.example.toml](tinycd.example.toml) for a copyable file. CLI values
-and `TINYCD_TOKEN` override the file. File values override built-in defaults.
-Relative paths in the file are resolved relative to the file's directory.
+and `TINYCD_TOKEN` override the file; `--env KEY=VALUE` entries override
+matching `[env]` keys. File values override built-in defaults. Relative paths
+in the file are resolved relative to the file's directory.
 
 The default file is optional. Passing `--config <path>` makes that specific
 file required. Unknown settings and invalid values are rejected.
+
+The sync, install, and start commands run through `shell` and inherit tinycd's
+environment plus the `[env]` table. tinycd does not manage language runtimes
+or virtual environments; compose the commands instead. One environment shared
+by every release is just absolute paths:
+
+```toml
+install = "/home/me/app-venv/bin/pip install -r requirements.txt"
+start = "/home/me/app-venv/bin/python -m uvicorn app:app"
+
+[env]
+PYTHONPATH = "/home/me/code"
+```
 
 ## Webhooks
 
@@ -127,3 +145,19 @@ rm .tinycd/interlock
 ```
 
 Interlock access errors fail closed.
+
+## Windows
+
+Commands run through `cmd /C` by default; point `shell` at PowerShell or Git
+Bash to change that. The default sync command uses `"%TINYCD_REPO%"`, and
+`git` must be on `PATH`.
+
+`current` is an NTFS junction, so neither administrator rights nor Developer
+Mode are needed. Every process a release spawns is tracked by a job object.
+Stopping a release sends Ctrl+Break when the release shares tinycd's console,
+waits ten seconds, then terminates everything left in the job. If tinycd itself
+dies, Windows closes the job and stops the release with it; starting tinycd
+again restarts the release from `current`.
+
+The config file permission check for `token` is Unix-only, so on Windows
+prefer the `TINYCD_TOKEN` environment variable.

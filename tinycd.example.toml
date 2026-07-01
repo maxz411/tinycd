@@ -9,7 +9,10 @@ poll = 30
 root = ".tinycd"
 interlock = ".tinycd/interlock"
 
-# Commands run inside each new deployment directory.
+# Shell that runs the commands. Defaults to sh -c, or cmd /C on Windows.
+# shell = ["powershell", "-NoProfile", "-Command"]
+
+# Commands run inside each new deployment directory. install is optional.
 sync = 'git clone --depth 1 "$TINYCD_REPO" .'
 install = "npm ci"
 start = "npm start"
@@ -19,3 +22,8 @@ keep = 5
 
 # Prefer TINYCD_TOKEN. If stored here, run: chmod 600 tinycd.toml
 # token = "replace-with-at-least-32-random-ASCII-characters"
+
+# Extra environment for sync, install, and start. Keep this table last:
+# keys below a table header belong to it.
+# [env]
+# PYTHONPATH = "/home/me/code"

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -23,7 +24,7 @@ use tokio::{
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// How long a stopping release gets to exit after SIGTERM before SIGKILL.
+/// How long a stopping release gets to exit gracefully before it is killed.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
@@ -66,6 +67,15 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     root: Option<PathBuf>,
 
+    /// Shell that runs sync, install, and start; repeat per argument, such as
+    /// --shell powershell --shell -Command. Defaults to sh -c (cmd /C on Windows).
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    shell: Vec<String>,
+
+    /// Extra KEY=VALUE environment for sync, install, and start; repeatable.
+    #[arg(long, value_name = "KEY=VALUE")]
+    env: Vec<String>,
+
     /// Command that syncs the local checkout.
     #[arg(long)]
     sync: Option<String>,
@@ -92,6 +102,8 @@ struct FileConfig {
     repo: Option<String>,
     interlock: Option<PathBuf>,
     root: Option<PathBuf>,
+    shell: Option<Vec<String>>,
+    env: BTreeMap<String, String>,
     sync: Option<String>,
     install: Option<String>,
     start: Option<String>,
@@ -135,8 +147,10 @@ struct Config {
     repo: String,
     interlock: PathBuf,
     root: PathBuf,
+    shell: Vec<String>,
+    env: BTreeMap<String, String>,
     sync: String,
-    install: String,
+    install: Option<String>,
     start: String,
     keep: usize,
 }
@@ -191,6 +205,31 @@ impl Config {
             .or_else(|| file.interlock.map(resolve))
             .unwrap_or_else(|| root.join("interlock"));
 
+        let shell = if cli.shell.is_empty() {
+            file.shell.unwrap_or_else(default_shell)
+        } else {
+            cli.shell
+        };
+        if shell.is_empty() {
+            return Err("shell must name a program".into());
+        }
+
+        let mut env = file.env;
+        for pair in cli.env {
+            match pair.split_once('=') {
+                Some((key, value)) if !key.is_empty() => {
+                    env.insert(key.to_owned(), value.to_owned());
+                }
+                _ => return Err(format!("--env {pair} must look like KEY=VALUE").into()),
+            }
+        }
+
+        let default_sync = if cfg!(windows) {
+            r#"git clone --depth 1 "%TINYCD_REPO%" ."#
+        } else {
+            r#"git clone --depth 1 "$TINYCD_REPO" ."#
+        };
+
         let keep = cli.keep.or(file.keep).unwrap_or(5);
         if keep == 0 {
             return Err("keep must be at least one deployment".into());
@@ -203,20 +242,27 @@ impl Config {
             repo: repo_url(cli.repo.or(file.repo), dir).await?,
             interlock,
             root,
+            shell,
+            env,
             sync: cli
                 .sync
                 .or(file.sync)
-                .unwrap_or_else(|| "git clone --depth 1 \"$TINYCD_REPO\" .".to_owned()),
-            install: cli
-                .install
-                .or(file.install)
-                .unwrap_or_else(|| "true".to_owned()),
+                .unwrap_or_else(|| default_sync.to_owned()),
+            install: cli.install.or(file.install),
             start: cli
                 .start
                 .or(file.start)
                 .ok_or("start must be configured with --start or in tinycd.toml")?,
             keep,
         })
+    }
+}
+
+fn default_shell() -> Vec<String> {
+    if cfg!(windows) {
+        vec!["cmd".to_owned(), "/C".to_owned()]
+    } else {
+        vec!["sh".to_owned(), "-c".to_owned()]
     }
 }
 
@@ -244,7 +290,7 @@ async fn repo_url(configured: Option<String>, dir: &Path) -> Result<String, Erro
 
 #[derive(Default)]
 struct Running {
-    child: Option<Child>,
+    server: Option<Server>,
     /// Remote HEAD at the last successful deployment.
     head: Option<String>,
 }
@@ -290,15 +336,16 @@ async fn run() -> Result<(), Error> {
         result = run => result,
         _ = shutdown_signal() => {
             println!("shutting down");
-            if let Some(child) = app.running.lock().await.child.take() {
-                stop_server(child).await?;
+            if let Some(server) = app.running.lock().await.server.take() {
+                server.stop().await?;
             }
             Ok(())
         }
     }
 }
 
-/// Wait for Ctrl+C or, on Unix, SIGTERM.
+/// Wait for Ctrl+C, SIGTERM on Unix, or a console close or system shutdown on
+/// Windows.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -309,21 +356,41 @@ async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+
+        let mut ctrl_break =
+            windows::ctrl_break().expect("failed to install the Ctrl+Break handler");
+        let mut ctrl_close = windows::ctrl_close().expect("failed to install the close handler");
+        let mut ctrl_shutdown =
+            windows::ctrl_shutdown().expect("failed to install the shutdown handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = ctrl_break.recv() => {}
+            _ = ctrl_close.recv() => {}
+            _ = ctrl_shutdown.recv() => {}
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Restart the release that current points at, if a previous run left one.
 async fn resume(app: &App) -> Result<(), Error> {
     let config = &app.config;
-    let current = match tokio::fs::canonicalize(config.root.join("current")).await {
-        Ok(current) => current,
+    let current = config.root.join("current");
+    match tokio::fs::canonicalize(&current).await {
+        Ok(resolved) => {
+            let deployments = tokio::fs::canonicalize(config.root.join("deployments")).await?;
+            if !resolved.starts_with(deployments) {
+                return Err("current points outside the deployments directory".into());
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
-    };
-    let deployments = tokio::fs::canonicalize(config.root.join("deployments")).await?;
-    if !current.starts_with(deployments) {
-        return Err("current points outside the deployments directory".into());
     }
 
     wait_for_interlock(&config.interlock).await?;
@@ -334,7 +401,7 @@ async fn resume(app: &App) -> Result<(), Error> {
         .filter(|head| !head.is_empty());
     println!("running start: {}", config.start);
     *app.running.lock().await = Running {
-        child: Some(start_server(config, &current)?),
+        server: Some(start_server(config, &current)?),
         head,
     };
     Ok(())
@@ -460,15 +527,15 @@ async fn deploy(app: &App) -> Result<(), Error> {
         return Err(error);
     }
 
-    if let Some(child) = running.child.take() {
-        stop_server(child).await?;
+    if let Some(server) = running.server.take() {
+        server.stop().await?;
     }
     println!("running start: {}", config.start);
-    running.child = Some(start_server(config, &release)?);
+    running.server = Some(start_server(config, &release)?);
 
     if let Err(error) = point_current(&config.root, &id) {
-        if let Some(child) = running.child.take() {
-            let _ = stop_server(child).await;
+        if let Some(server) = running.server.take() {
+            let _ = server.stop().await;
         }
         return Err(format!("failed to update the current deployment: {error}").into());
     }
@@ -485,14 +552,14 @@ async fn deploy(app: &App) -> Result<(), Error> {
 /// Run the sync and install commands in the staging folder, then promote it to
 /// a release folder once the interlock allows.
 async fn build(config: &Config, staging: &Path, release: &Path) -> Result<(), Error> {
-    for (name, command) in [("sync", &config.sync), ("install", &config.install)] {
-        println!("running {name}: {command}");
-        let mut process = Command::new("sh");
-        process
-            .args(["-c", command])
-            .current_dir(staging)
-            .env_remove("TINYCD_TOKEN")
-            .env_remove("TINYCD_REPO");
+    let steps = [
+        ("sync", Some(&config.sync)),
+        ("install", config.install.as_ref()),
+    ];
+    for (name, line) in steps {
+        let Some(line) = line else { continue };
+        println!("running {name}: {line}");
+        let mut process = shell_command(config, line, staging);
         if name == "sync" {
             process.env("TINYCD_REPO", &config.repo);
         }
@@ -510,60 +577,173 @@ async fn build(config: &Config, staging: &Path, release: &Path) -> Result<(), Er
     Ok(())
 }
 
-fn start_server(config: &Config, release: &Path) -> Result<Child, Error> {
-    let mut command = Command::new("sh");
+/// A command line run through the configured shell with the configured
+/// environment. Deployment commands never inherit tinycd's own secrets.
+fn shell_command(config: &Config, line: &str, dir: &Path) -> Command {
+    let (program, args) = config.shell.split_first().expect("shell is validated");
+    let mut command = Command::new(program);
     command
-        .args(["-c", &config.start])
-        .current_dir(release)
+        .args(args)
+        .arg(line)
+        .current_dir(dir)
         .env_remove("TINYCD_TOKEN")
         .env_remove("TINYCD_REPO")
-        .kill_on_drop(true);
-    // A dedicated process group lets stop_server signal every process the
-    // start command spawns, not just the shell.
-    #[cfg(unix)]
-    command.process_group(0);
-    Ok(command.spawn()?)
+        .envs(&config.env);
+    command
 }
 
-/// Stop a release: SIGTERM its process group, wait up to GRACE_PERIOD, then
-/// SIGKILL whatever remains. Windows falls back to killing the shell.
-async fn stop_server(mut child: Child) -> Result<(), Error> {
-    #[cfg(unix)]
-    if let Some(group) = child.id() {
-        unsafe { libc::killpg(group as i32, libc::SIGTERM) };
-        if tokio::time::timeout(GRACE_PERIOD, child.wait())
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "server did not exit within {} seconds, killing it",
-                GRACE_PERIOD.as_secs()
-            );
-        }
-        unsafe { libc::killpg(group as i32, libc::SIGKILL) };
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill().await;
+/// A running release. On Windows a job object tracks every process the start
+/// command spawns; closing the handle kills whatever is left in the job, so
+/// nothing outlives tinycd even if tinycd crashes.
+struct Server {
+    child: Child,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+}
 
-    child
-        .wait()
-        .await
-        .map_err(|error| format!("failed to stop the running server: {error}"))?;
-    Ok(())
+fn start_server(config: &Config, release: &Path) -> Result<Server, Error> {
+    let mut command = shell_command(config, &config.start, release);
+    command.kill_on_drop(true);
+    // A dedicated process group lets stop() signal every process the start
+    // command spawns, not just the shell, and keeps the terminal's Ctrl+C
+    // for tinycd's own shutdown handling.
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+
+    let child = command.spawn()?;
+    #[cfg(windows)]
+    let job = assign_job(&child)?;
+    Ok(Server {
+        child,
+        #[cfg(windows)]
+        job,
+    })
+}
+
+impl Server {
+    /// Stop the whole process tree: ask politely, wait up to GRACE_PERIOD,
+    /// then kill. Politely means SIGTERM to the process group on Unix and
+    /// Ctrl+Break on Windows, which only reaches the server when it shares
+    /// tinycd's console.
+    async fn stop(mut self) -> Result<(), Error> {
+        #[cfg(unix)]
+        if let Some(group) = self.child.id() {
+            unsafe { libc::killpg(group as i32, libc::SIGTERM) };
+            if tokio::time::timeout(GRACE_PERIOD, self.child.wait())
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "server did not exit within {} seconds, killing it",
+                    GRACE_PERIOD.as_secs()
+                );
+            }
+            unsafe { libc::killpg(group as i32, libc::SIGKILL) };
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+            let polite = self.child.id().is_some_and(|group| unsafe {
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) != 0
+            });
+            if polite
+                && tokio::time::timeout(GRACE_PERIOD, self.child.wait())
+                    .await
+                    .is_err()
+            {
+                eprintln!(
+                    "server did not exit within {} seconds, killing it",
+                    GRACE_PERIOD.as_secs()
+                );
+            }
+            unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 1) };
+        }
+
+        self.child
+            .wait()
+            .await
+            .map_err(|error| format!("failed to stop the running server: {error}"))?;
+        Ok(())
+    }
+}
+
+/// Put the spawned server into a new job object that kills every remaining
+/// process in the job when the handle closes.
+#[cfg(windows)]
+fn assign_job(child: &Child) -> Result<std::os::windows::io::OwnedHandle, Error> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            raw,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let process = child
+        .raw_handle()
+        .ok_or("the server exited before it could be tracked")?;
+    if unsafe { AssignProcessToJobObject(raw, process) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(job)
 }
 
 /// Atomically repoint the current symlink at the release with this id.
+#[cfg(not(windows))]
 fn point_current(root: &Path, id: &str) -> std::io::Result<()> {
     let staging = root.join(format!(".current-{id}"));
     let target = Path::new("deployments").join(id);
-    #[cfg(unix)]
-    let link = std::os::unix::fs::symlink(target, &staging);
-    #[cfg(windows)]
-    let link = std::os::windows::fs::symlink_dir(target, &staging);
-
-    link.and_then(|()| std::fs::rename(&staging, root.join("current")))
+    std::os::unix::fs::symlink(target, &staging)
+        .and_then(|()| std::fs::rename(&staging, root.join("current")))
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&staging);
+        })
+}
+
+/// Repoint the current junction at the release with this id. Junctions work
+/// without administrator rights or Developer Mode, unlike directory symlinks.
+#[cfg(windows)]
+fn point_current(root: &Path, id: &str) -> std::io::Result<()> {
+    let staging = root.join(format!(".current-{id}"));
+    let target = std::path::absolute(root.join("deployments").join(id))?;
+    junction::create(&target, &staging)?;
+
+    let current = root.join("current");
+    std::fs::rename(&staging, &current)
+        .or_else(|_| {
+            // Windows cannot rename over an existing directory entry. Drop the
+            // old junction (an empty directory) and retry; if tinycd dies
+            // between the two steps, the next poll redeploys.
+            std::fs::remove_dir(&current)?;
+            std::fs::rename(&staging, &current)
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir(&staging);
         })
 }
 
