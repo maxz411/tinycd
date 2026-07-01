@@ -1,0 +1,21 @@
+# Git URL or an existing remote name. Defaults to origin.
+repo = "git@github.com:example/app.git"
+
+# Enable polling, webhooks, or both. Polling defaults to 30 when neither is set.
+poll = 30
+# hook = "127.0.0.1:8080"
+
+# Paths are relative to this file.
+root = ".tinycd"
+interlock = ".tinycd/interlock"
+
+# Commands run inside each new deployment directory.
+sync = 'git clone --depth 1 "$TINYCD_REPO" .'
+install = "npm ci"
+start = "npm start"
+
+# Retain enough releases for quick rollback without filling a home computer.
+keep = 5
+
+# Prefer TINYCD_TOKEN. If stored here, run: chmod 600 tinycd.toml
+# token = "replace-with-at-least-32-random-ASCII-characters"
