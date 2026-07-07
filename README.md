@@ -10,6 +10,24 @@ sync -> install -> start
 Each deployment gets a new folder. Older deployments are retained for rollback,
 and `current` is atomically moved to the newest launched release.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/maxz411/tinycd/main/install.sh | sh
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/maxz411/tinycd/main/install.ps1 | iex"
+```
+
+The script downloads the latest [release](https://github.com/maxz411/tinycd/releases),
+verifies its checksum, and installs a single binary to `~/.local/bin`
+(`%LOCALAPPDATA%\tinycd\bin` on Windows). The Linux binaries are fully static,
+so they run on any distribution. `git` must be on `PATH` at runtime. To build
+from source instead, run `cargo install --path .` from a checkout.
+
 ## Quick start
 
 Commit a `tinycd.toml` to the project being deployed:

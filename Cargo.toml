@@ -1,9 +1,17 @@
 [package]
 name = "tinycd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Tiny polling and webhook based deployments"
 license = "Apache-2.0"
+repository = "https://github.com/maxz411/tinycd"
+readme = "README.md"
+keywords = ["deployment", "cd", "git", "webhook", "devops"]
+categories = ["command-line-utilities", "development-tools"]
+
+[profile.release]
+strip = true
+lto = true
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
