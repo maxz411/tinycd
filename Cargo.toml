@@ -6,7 +6,7 @@ description = "Tiny polling and webhook based deployments"
 license = "Apache-2.0"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"

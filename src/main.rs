@@ -28,9 +28,28 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_help = "\
+Examples:
+  tinycd                                       track this checkout's remote
+  tinycd ~/code/app                            track another checkout
+  tinycd git@github.com:example/app.git        deploy a URL into this directory
+  tinycd https://github.com/e/app.git ~/blog   deploy a URL into ~/blog"
+)]
 struct Cli {
-    /// Config file. Defaults to tinycd.toml when that file exists.
+    /// Git URL to deploy, or a Git checkout to track. Defaults to the
+    /// current directory.
+    #[arg(value_name = "SOURCE")]
+    source: Option<String>,
+
+    /// Directory that holds the deployments when SOURCE is a Git URL.
+    /// Defaults to the current directory.
+    #[arg(value_name = "DIR")]
+    dir: Option<PathBuf>,
+
+    /// Config file. Defaults to tinycd.toml in the tracked directory.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -119,23 +138,8 @@ impl FileConfig {
             }
             Err(error) => return Err(format!("failed to read {}: {error}", path.display()).into()),
         };
-        let file: Self = toml::from_str(&source)
-            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-
-        #[cfg(unix)]
-        if file.token.is_some() {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = tokio::fs::metadata(path).await?.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(format!(
-                    "{} contains a token and must not be readable by group or other users",
-                    path.display()
-                )
-                .into());
-            }
-        }
-        Ok(file)
+        toml::from_str(&source)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()).into())
     }
 }
 
@@ -147,24 +151,70 @@ struct Config {
     repo: String,
     interlock: PathBuf,
     root: PathBuf,
-    shell: Vec<String>,
-    env: BTreeMap<String, String>,
     sync: String,
-    install: Option<String>,
-    start: String,
     keep: usize,
+    /// Project settings from the CLI and the local config file. They override
+    /// the tinycd.toml inside the repository, which is merged per release.
+    overrides: Overrides,
+}
+
+/// The settings a repository's own tinycd.toml may provide.
+struct Overrides {
+    shell: Option<Vec<String>>,
+    env: BTreeMap<String, String>,
+    install: Option<String>,
+    start: Option<String>,
+}
+
+impl Overrides {
+    /// Resolve the shell: the overrides win, then a repository's tinycd.toml,
+    /// then the platform default.
+    fn resolve_shell(&self, file: Option<Vec<String>>) -> Vec<String> {
+        self.shell.clone().or(file).unwrap_or_else(default_shell)
+    }
 }
 
 impl Config {
-    /// Merge the CLI over the config file over the built-in defaults.
+    /// Merge the CLI over the local config file over the built-in defaults.
+    /// Settings that describe the project itself may also come from the
+    /// tinycd.toml inside the repository; those are merged per release.
     async fn load(cli: Cli) -> Result<Self, Error> {
+        let mode = Mode::resolve(cli.source, cli.dir)?;
+        if cli.repo.is_some() && matches!(mode, Mode::Url { .. }) {
+            return Err(
+                "pass the repository as either the first argument or --repo, not both".into(),
+            );
+        }
+        if let (Mode::Url { repo, home }, None) = (&mode, &cli.config) {
+            write_local_config(home, repo)?;
+        }
+        let project = match &mode {
+            Mode::Local { project } => project.clone(),
+            Mode::Url { home, .. } => home.clone(),
+        };
+
         let required = cli.config.is_some();
-        let path = cli.config.unwrap_or_else(|| PathBuf::from("tinycd.toml"));
+        let path = cli.config.unwrap_or_else(|| project.join("tinycd.toml"));
         let dir = path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let file = FileConfig::load(&path, required).await?;
+
+        // Only the local file's token is used, so only it must be private.
+        #[cfg(unix)]
+        if file.token.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = tokio::fs::metadata(&path).await?.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "{} contains a token and must not be readable by group or other users",
+                    path.display()
+                )
+                .into());
+            }
+        }
 
         let mut poll = cli.poll.or(file.poll);
         let hook = cli.hook.or(file.hook);
@@ -190,27 +240,32 @@ impl Config {
         // Relative paths in the file are relative to the file; relative CLI
         // paths are relative to the working directory.
         let resolve = |path: PathBuf| {
-            if path.is_absolute() {
+            let path = if path.is_absolute() {
                 path
             } else {
                 dir.join(path)
-            }
+            };
+            std::path::absolute(&path).unwrap_or(path)
         };
-        let root = cli
-            .root
-            .or_else(|| file.root.map(resolve))
-            .unwrap_or_else(|| dir.join(".tinycd"));
+        let root = match (cli.root, file.root) {
+            (Some(root), _) => root,
+            (None, Some(root)) => resolve(root),
+            (None, None) => match &mode {
+                Mode::Local { project } => state_root(project)?,
+                Mode::Url { home, .. } => home.clone(),
+            },
+        };
         let interlock = cli
             .interlock
             .or_else(|| file.interlock.map(resolve))
             .unwrap_or_else(|| root.join("interlock"));
 
         let shell = if cli.shell.is_empty() {
-            file.shell.unwrap_or_else(default_shell)
+            file.shell
         } else {
-            cli.shell
+            Some(cli.shell)
         };
-        if shell.is_empty() {
+        if shell.as_deref().is_some_and(|shell| shell.is_empty()) {
             return Err("shell must name a program".into());
         }
 
@@ -235,25 +290,29 @@ impl Config {
             return Err("keep must be at least one deployment".into());
         }
 
+        let repo = match mode {
+            Mode::Url { repo, .. } => repo,
+            Mode::Local { .. } => repo_url(cli.repo.or(file.repo), &project).await?,
+        };
+
         Ok(Self {
             poll,
             hook,
             token: token.map(|token| Sha256::digest(token.as_bytes()).into()),
-            repo: repo_url(cli.repo.or(file.repo), dir).await?,
+            repo,
             interlock,
             root,
-            shell,
-            env,
             sync: cli
                 .sync
                 .or(file.sync)
                 .unwrap_or_else(|| default_sync.to_owned()),
-            install: cli.install.or(file.install),
-            start: cli
-                .start
-                .or(file.start)
-                .ok_or("start must be configured with --start or in tinycd.toml")?,
             keep,
+            overrides: Overrides {
+                shell,
+                env,
+                install: cli.install.or(file.install),
+                start: cli.start.or(file.start),
+            },
         })
     }
 }
@@ -266,16 +325,156 @@ fn default_shell() -> Vec<String> {
     }
 }
 
+/// Where the repository and the deployment state come from.
+enum Mode {
+    /// Track a local checkout: poll its remote and keep deployments under
+    /// ~/.tinycd so the working tree stays clean.
+    Local { project: PathBuf },
+    /// Deploy a Git URL: configuration and deployments live in home.
+    Url { repo: String, home: PathBuf },
+}
+
+impl Mode {
+    fn resolve(source: Option<String>, dir: Option<PathBuf>) -> Result<Self, Error> {
+        let Some(source) = source else {
+            return Ok(Self::Local {
+                project: project_dir(Path::new("."))?,
+            });
+        };
+        if looks_like_git_url(&source) {
+            let home = dir.unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&home)
+                .map_err(|error| format!("failed to create {}: {error}", home.display()))?;
+            return Ok(Self::Url {
+                repo: source,
+                home: std::path::absolute(&home)?,
+            });
+        }
+        if dir.is_some() {
+            return Err("a second path is only accepted after a Git URL".into());
+        }
+        Ok(Self::Local {
+            project: project_dir(Path::new(&source))?,
+        })
+    }
+}
+
+fn project_dir(path: &Path) -> Result<PathBuf, Error> {
+    if !path.is_dir() {
+        return Err(format!(
+            "{} is neither an existing directory nor a Git URL",
+            path.display()
+        )
+        .into());
+    }
+    Ok(std::path::absolute(path)?)
+}
+
+/// A scheme:// URL or an scp-like [user@]host:path. Windows drive paths such
+/// as C:\app have a single-letter host and stay paths.
+fn looks_like_git_url(source: &str) -> bool {
+    source.contains("://")
+        || source
+            .split_once(':')
+            .is_some_and(|(host, _)| host.len() > 1 && !host.contains('/') && !host.contains('\\'))
+}
+
+/// Deployments for a tracked checkout live under ~/.tinycd, keyed by the
+/// checkout's absolute path, so the working tree stays clean and a restart
+/// finds the same releases.
+fn state_root(project: &Path) -> Result<PathBuf, Error> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(variable)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{variable} must be set to place deployments; or pass --root"))?;
+
+    let name: String = project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "project".to_owned())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+    let key = format!(
+        "{name}-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+    Ok(home.join(".tinycd").join(key))
+}
+
+/// Record the deployed repository next to the deployments so a plain `tinycd`
+/// run there restarts the same deployment. Files tinycd wrote earlier are
+/// refreshed when the URL changes; files the user authored are left alone.
+fn write_local_config(home: &Path, repo: &str) -> Result<(), Error> {
+    const MARKER: &str = "# Written by tinycd";
+
+    let path = home.join("tinycd.toml");
+    let repo = repo.replace('\\', r"\\").replace('"', "\\\"");
+    let contents = format!(
+        "{MARKER}; running `tinycd` in this directory resumes the deployment.\n\
+         repo = \"{repo}\"\nroot = \".\"\n"
+    );
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if existing == contents || !existing.starts_with(MARKER) => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display()).into()),
+    }
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Hold an exclusive lock on <root>/lock so a second tinycd cannot manage the
+/// same root. Roots never overlap between projects, so each project gets its
+/// own instance. The lock is advisory and dies with the process.
+fn lock_root(root: &Path) -> Result<std::fs::File, Error> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("failed to create {}: {error}", root.display()))?;
+    let path = root.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(format!("another tinycd is already managing {}", root.display()).into())
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(format!("failed to lock {}: {error}", path.display()).into())
+        }
+    }
+}
+
+/// A git invocation that never sees tinycd's own secrets.
+fn git(args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .env_remove("TINYCD_TOKEN")
+        .env_remove("TINYCD_REPO");
+    command
+}
+
 /// Expand a remote name (or the default, origin) into its URL via the Git
-/// project next to the config file. Values that are not a known remote are
-/// used as-is.
+/// project being tracked. Values that are not a known remote are used as-is.
 async fn repo_url(configured: Option<String>, dir: &Path) -> Result<String, Error> {
     let remote = configured.as_deref().unwrap_or("origin");
-    let output = Command::new("git")
-        .args(["remote", "get-url", remote])
+    let output = git(&["remote", "get-url", remote])
         .current_dir(dir)
-        .env_remove("TINYCD_TOKEN")
-        .env_remove("TINYCD_REPO")
         .output()
         .await;
 
@@ -283,8 +482,12 @@ async fn repo_url(configured: Option<String>, dir: &Path) -> Result<String, Erro
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         }
-        _ => Ok(configured
-            .ok_or("repo is not configured and the current project has no origin remote")?),
+        _ => Ok(configured.ok_or_else(|| {
+            format!(
+                "{} is not a Git checkout with an origin remote; pass a Git URL or set repo in tinycd.toml",
+                dir.display()
+            )
+        })?),
     }
 }
 
@@ -317,6 +520,9 @@ async fn run() -> Result<(), Error> {
         config: Arc::new(Config::load(Cli::parse()).await?),
         running: Arc::default(),
     };
+    let _lock = lock_root(&app.config.root)?;
+    println!("tracking {}", app.config.repo);
+    println!("deployments in {}", app.config.root.display());
 
     resume(&app).await?;
 
@@ -399,9 +605,10 @@ async fn resume(app: &App) -> Result<(), Error> {
         .ok()
         .map(|head| head.trim().to_owned())
         .filter(|head| !head.is_empty());
-    println!("running start: {}", config.start);
+    let spec = run_spec(config, &current).await?;
+    println!("running start: {}", spec.start);
     *app.running.lock().await = Running {
-        server: Some(start_server(config, &current)?),
+        server: Some(start_server(&spec, &current)?),
         head,
     };
     Ok(())
@@ -436,12 +643,7 @@ async fn poll(app: App, seconds: u64) -> Result<(), Error> {
 }
 
 async fn remote_head(repo: &str) -> Result<String, Error> {
-    let output = Command::new("git")
-        .args(["ls-remote", repo, "HEAD"])
-        .env_remove("TINYCD_TOKEN")
-        .env_remove("TINYCD_REPO")
-        .output()
-        .await?;
+    let output = git(&["ls-remote", repo, "HEAD"]).output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -484,7 +686,9 @@ async fn serve(app: App, address: SocketAddr) -> Result<(), Error> {
             }),
         )
         .with_state(app);
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("failed to listen on {address}: {error}"))?;
 
     println!("listening for POST /deploy on {address}");
     axum::serve(listener, router).await?;
@@ -522,16 +726,19 @@ async fn deploy(app: &App) -> Result<(), Error> {
     tokio::fs::create_dir_all(&deployments).await?;
     tokio::fs::create_dir(&staging).await?;
 
-    if let Err(error) = build(config, &staging, &release).await {
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        return Err(error);
-    }
+    let spec = match build(config, &staging, &release).await {
+        Ok(spec) => spec,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(error);
+        }
+    };
 
     if let Some(server) = running.server.take() {
         server.stop().await?;
     }
-    println!("running start: {}", config.start);
-    running.server = Some(start_server(config, &release)?);
+    println!("running start: {}", spec.start);
+    running.server = Some(start_server(&spec, &release)?);
 
     if let Err(error) = point_current(&config.root, &id) {
         if let Some(server) = running.server.take() {
@@ -549,24 +756,60 @@ async fn deploy(app: &App) -> Result<(), Error> {
     Ok(())
 }
 
+/// How to install and start one release: the repository's tinycd.toml
+/// provides the values, and the CLI or the local config file override them.
+struct RunSpec {
+    shell: Vec<String>,
+    env: BTreeMap<String, String>,
+    install: Option<String>,
+    start: String,
+}
+
+/// Merge the local overrides with the tinycd.toml inside a synced release.
+/// Launcher-level settings in the repository's file are ignored.
+async fn run_spec(config: &Config, release: &Path) -> Result<RunSpec, Error> {
+    let file = FileConfig::load(&release.join("tinycd.toml"), false).await?;
+    let overrides = &config.overrides;
+
+    let shell = overrides.resolve_shell(file.shell);
+    if shell.is_empty() {
+        return Err("shell must name a program".into());
+    }
+    let mut env = file.env;
+    env.extend(overrides.env.clone());
+
+    Ok(RunSpec {
+        shell,
+        env,
+        install: overrides.install.clone().or(file.install),
+        start: overrides.start.clone().or(file.start).ok_or(
+            "start is not configured; set it in the repository's tinycd.toml, the local tinycd.toml, or with --start",
+        )?,
+    })
+}
+
 /// Run the sync and install commands in the staging folder, then promote it to
 /// a release folder once the interlock allows.
-async fn build(config: &Config, staging: &Path, release: &Path) -> Result<(), Error> {
-    let steps = [
-        ("sync", Some(&config.sync)),
-        ("install", config.install.as_ref()),
-    ];
-    for (name, line) in steps {
-        let Some(line) = line else { continue };
-        println!("running {name}: {line}");
-        let mut process = shell_command(config, line, staging);
-        if name == "sync" {
-            process.env("TINYCD_REPO", &config.repo);
-        }
+async fn build(config: &Config, staging: &Path, release: &Path) -> Result<RunSpec, Error> {
+    println!("running sync: {}", config.sync);
+    let shell = config.overrides.resolve_shell(None);
+    let mut process = shell_command(&shell, &config.overrides.env, &config.sync, staging);
+    process.env("TINYCD_REPO", &config.repo);
+    let status = process.status().await?;
+    if !status.success() {
+        return Err(format!("sync command exited with {status}").into());
+    }
 
-        let status = process.status().await?;
+    // Read the freshly synced repository's tinycd.toml, so install and start
+    // follow the deployed commit.
+    let spec = run_spec(config, staging).await?;
+    if let Some(install) = &spec.install {
+        println!("running install: {install}");
+        let status = shell_command(&spec.shell, &spec.env, install, staging)
+            .status()
+            .await?;
         if !status.success() {
-            return Err(format!("{name} command exited with {status}").into());
+            return Err(format!("install command exited with {status}").into());
         }
     }
 
@@ -574,13 +817,18 @@ async fn build(config: &Config, staging: &Path, release: &Path) -> Result<(), Er
     // touching the running server.
     wait_for_interlock(&config.interlock).await?;
     tokio::fs::rename(staging, release).await?;
-    Ok(())
+    Ok(spec)
 }
 
-/// A command line run through the configured shell with the configured
-/// environment. Deployment commands never inherit tinycd's own secrets.
-fn shell_command(config: &Config, line: &str, dir: &Path) -> Command {
-    let (program, args) = config.shell.split_first().expect("shell is validated");
+/// A command line run through the given shell with the given environment.
+/// Deployment commands never inherit tinycd's own secrets.
+fn shell_command(
+    shell: &[String],
+    env: &BTreeMap<String, String>,
+    line: &str,
+    dir: &Path,
+) -> Command {
+    let (program, args) = shell.split_first().expect("shell is validated");
     let mut command = Command::new(program);
     command
         .args(args)
@@ -588,7 +836,7 @@ fn shell_command(config: &Config, line: &str, dir: &Path) -> Command {
         .current_dir(dir)
         .env_remove("TINYCD_TOKEN")
         .env_remove("TINYCD_REPO")
-        .envs(&config.env);
+        .envs(env);
     command
 }
 
@@ -601,8 +849,8 @@ struct Server {
     job: std::os::windows::io::OwnedHandle,
 }
 
-fn start_server(config: &Config, release: &Path) -> Result<Server, Error> {
-    let mut command = shell_command(config, &config.start, release);
+fn start_server(spec: &RunSpec, release: &Path) -> Result<Server, Error> {
+    let mut command = shell_command(&spec.shell, &spec.env, &spec.start, release);
     command.kill_on_drop(true);
     // A dedicated process group lets stop() signal every process the start
     // command spawns, not just the shell, and keeps the terminal's Ctrl+C

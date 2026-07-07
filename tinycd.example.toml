@@ -1,3 +1,6 @@
+# In a tinycd.toml committed to the deployed repository, only shell, env,
+# install, and start are used; the rest come from the machine running tinycd.
+
 # Git URL or an existing remote name. Defaults to origin.
 repo = "git@github.com:example/app.git"
 
@@ -5,7 +8,9 @@ repo = "git@github.com:example/app.git"
 poll = 30
 # hook = "127.0.0.1:8080"
 
-# Paths are relative to this file.
+# Where deployments live; paths are relative to this file. Defaults to this
+# file's directory when tinycd is given a Git URL, or ~/.tinycd/<name>-<hash>
+# when it tracks a checkout.
 root = ".tinycd"
 interlock = ".tinycd/interlock"
 

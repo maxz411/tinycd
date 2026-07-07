@@ -12,43 +12,71 @@ and `current` is atomically moved to the newest launched release.
 
 ## Quick start
 
-Create `tinycd.toml` in the Git project:
+Commit a `tinycd.toml` to the project being deployed:
 
 ```toml
 install = "npm ci"
 start = "npm start"
 ```
 
-Then run:
+Then point tinycd at the project's Git URL and a directory to deploy into:
 
 ```sh
-tinycd
+tinycd git@github.com:example/app.git ~/apps/example
 ```
 
-With no other configuration, tinycd reads the repository's `origin`, polls it
-every 30 seconds, shallow-clones new releases, keeps five releases, and uses
-`.tinycd/interlock` as the deployment interlock. A fresh polling setup deploys
-immediately. After a restart, tinycd starts the existing `current` release,
-then deploys anything that was pushed while it was down.
+tinycd clones the repository, reads `tinycd.toml` from the clone, installs
+and starts it, and redeploys whenever the remote changes. The directory
+defaults to the current one, and a small `tinycd.toml` recording the URL is
+written into it, so `tinycd ~/apps/example` (or a plain `tinycd` inside it)
+restarts the same deployment after a reboot.
+
+Alternatively, run tinycd from inside a checkout, or point it at one:
+
+```sh
+tinycd            # track this checkout's origin
+tinycd ~/code/app # track that checkout's origin
+```
+
+Deployments then live under `~/.tinycd/<name>-<hash>` instead of the working
+tree, so the checkout stays an ordinary place to work: commit and push from
+it, or push from another machine, and tinycd deploys the new commit either
+way.
+
+With no other configuration, tinycd polls the remote every 30 seconds,
+shallow-clones new releases, keeps five releases, and uses `<root>/interlock`
+as the deployment interlock. A fresh setup deploys immediately. After a
+restart, tinycd starts the existing `current` release, then deploys anything
+that was pushed while it was down.
 
 The defaults are:
 
 ```toml
 poll = 30
-root = ".tinycd"
-interlock = ".tinycd/interlock"
+interlock = "<root>/interlock"
 shell = ["sh", "-c"]                          # ["cmd", "/C"] on Windows
 sync = 'git clone --depth 1 "$TINYCD_REPO" .' # "%TINYCD_REPO%" on Windows
 keep = 5
 ```
 
-`repo` defaults to the current Git project's `origin`. `hook` and `install`
-are disabled by default. `start` has no default because guessing how to launch
-an arbitrary project would be unsafe.
+`root` — the folder holding the deployments and the `current` link — defaults
+to the deployment directory when tinycd is given a Git URL, and to
+`~/.tinycd/<name>-<hash>` when it tracks a checkout. `repo` defaults to the
+tracked checkout's `origin`. `hook` and `install` are disabled by default.
+`start` has no default because guessing how to launch an arbitrary project
+would be unsafe.
 
 ## Configuration
 
-All runtime settings can be placed in `tinycd.toml`:
+tinycd reads up to two config files: the local `tinycd.toml` in the tracked
+directory (or the file named by `--config`), and the `tinycd.toml` inside the
+repository, re-read from every synced release. The repository's file provides
+`shell`, `env`, `install`, and `start`, so a project carries its own
+deployment recipe and changes take effect on the next deployment. Everything
+else — what to watch and where to keep releases — only comes from the machine
+running tinycd.
+
+All runtime settings can be placed in the local `tinycd.toml`:
 
 ```toml
 repo = "git@github.com:example/app.git"
@@ -67,11 +95,12 @@ PYTHONPATH = "/home/me/code"
 ```
 
 See [tinycd.example.toml](tinycd.example.toml) for a copyable file. CLI values
-and `TINYCD_TOKEN` override the file; `--env KEY=VALUE` entries override
-matching `[env]` keys. File values override built-in defaults. Relative paths
-in the file are resolved relative to the file's directory.
+and `TINYCD_TOKEN` override the local file, the local file overrides the
+repository's file, and both override built-in defaults; `--env KEY=VALUE`
+entries override matching `[env]` keys. Relative paths in a local file are
+resolved relative to the file's directory.
 
-The default file is optional. Passing `--config <path>` makes that specific
+The default files are optional. Passing `--config <path>` makes that specific
 file required. Unknown settings and invalid values are rejected.
 
 The sync, install, and start commands run through `shell` and inherit tinycd's
@@ -114,16 +143,22 @@ to the sync command are removed from install and start environments.
 
 ## Deployments
 
-The default layout is:
+The root — printed at startup — is laid out as:
 
 ```text
-.tinycd/
+<root>/
 ├── current -> deployments/1751392800000
 ├── head
+├── lock
 └── deployments/
     ├── 1751392700000/
     └── 1751392800000/
 ```
+
+Run one tinycd per project; any number can run side by side because every
+project has its own root, and tinycd holds an exclusive lock on `<root>/lock`
+so a second instance pointed at the same root refuses to start. Instances
+that listen for webhooks each need their own `hook` address.
 
 The sync command starts in a new empty deployment folder. `TINYCD_REPO` is
 available only to that command. Install and start run in the populated folder.
@@ -140,8 +175,8 @@ Create the interlock file to pause before syncing or restarting, then remove it
 to continue:
 
 ```sh
-touch .tinycd/interlock
-rm .tinycd/interlock
+touch "<root>/interlock"
+rm "<root>/interlock"
 ```
 
 Interlock access errors fail closed.
