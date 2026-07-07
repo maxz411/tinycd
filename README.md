@@ -196,3 +196,11 @@ again restarts the release from `current`.
 
 The config file permission check for `token` is Unix-only, so on Windows
 prefer the `TINYCD_TOKEN` environment variable.
+
+## Agent skills
+
+The [skills/](skills/) directory ships skills for Claude Code and compatible
+agents: `tinycd-setup` walks through setting up deployments end to end, and
+`tinycd-configuration` documents every option, the precedence rules, and
+common misconfigurations. Copy them into your agent's skills directory or
+point it at this repository.
