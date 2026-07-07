@@ -1,6 +1,6 @@
 ---
 name: tinycd-configuration
-description: Reference for every tinycd configuration option (repo, poll, hook, token, root, interlock, shell, sync, install, start, keep, env) — where each may be set, precedence between the CLI, the local tinycd.toml, and the repository's tinycd.toml, path and environment resolution rules, and worked examples for common stacks. Use when writing or debugging a tinycd.toml, choosing CLI flags, or explaining why a setting did not take effect.
+description: Reference for every tinycd configuration option (repo, poll, hook, token, root, interlock, shell, sync, install, start, keep, env) — where each may be set, precedence between the CLI, the local .tinycd/config.toml, and the repository's .tinycd/config.toml, path and environment resolution rules, and worked examples for common stacks. Use when writing or debugging a .tinycd/config.toml, choosing CLI flags, or explaining why a setting did not take effect.
 ---
 
 # tinycd configuration reference
@@ -10,9 +10,9 @@ description: Reference for every tinycd configuration option (repo, poll, hook, 
 Settings merge from four layers; the first layer that sets a value wins:
 
 1. **CLI flags** (and the `TINYCD_TOKEN` environment variable).
-2. **The local `tinycd.toml`** in the tracked directory, or the file named by
+2. **The local `.tinycd/config.toml`** in the tracked directory, or the file named by
    `--config` (which makes that file required instead of optional).
-3. **The repository's `tinycd.toml`**, read from each freshly synced release —
+3. **The repository's `.tinycd/config.toml`**, read from each freshly synced release —
    but only for the project recipe: `shell`, `env`, `install`, `start`.
 4. **Built-in defaults.**
 
@@ -21,7 +21,7 @@ runs*, while the machine running tinycd decides *what to watch and where to
 keep releases*. Launcher-level keys (`repo`, `poll`, `hook`, `token`, `root`,
 `interlock`, `sync`, `keep`) inside a repository's copy are silently ignored —
 they only apply when that file is the local file (i.e. when tracking a
-checkout, where the working tree's `tinycd.toml` is the local file).
+checkout, where the working tree's `.tinycd/config.toml` is the local file).
 
 Rules that apply everywhere:
 
@@ -60,18 +60,19 @@ deployed. Requires `token`.
 
 ### token — webhook bearer token
 At least 32 printable non-space ASCII characters. Prefer `TINYCD_TOKEN` in
-the environment: a token in `tinycd.toml` requires the file to be unreadable
+the environment: a token in `.tinycd/config.toml` requires the file to be unreadable
 by group/other on Unix (`chmod 600`), and `--token` puts it in the process
 list. Only the local file's token is used; a `token` in the repository's copy
 is ignored. tinycd stores and compares only a SHA-256 of it.
 
 ### root — deployment state directory
-Path. Default: the deployment directory itself when tinycd was given a Git
-URL; `~/.tinycd/<name>-<hash>` when tracking a checkout (name from the
-directory, hash from its absolute path). Contains `current` (symlink on Unix,
-junction on Windows), `head` (last deployed commit), `lock` (one instance per
-root), and `deployments/`. Point two projects at the same root and the second
-instance refuses to start.
+Path. Default: `<dir>/.tinycd` when tinycd was given a Git URL;
+`~/.tinycd/<name>-<hash>` when tracking a checkout (name from the directory,
+hash from its absolute path). Contains `current` (symlink on Unix, junction
+on Windows), `head` (last deployed commit), `lock` (one instance per root),
+and `deployments/`. Relative values resolve against the config file's
+directory, so `root = "."` keeps releases inside `.tinycd/`. Point two
+projects at the same root and the second instance refuses to start.
 
 ### interlock — pause file
 Path. Default: `<root>/interlock`. While the file exists, tinycd waits before
@@ -95,7 +96,7 @@ before that file exists locally.
 
 ### install — build a release (optional)
 Command string, disabled by default. Runs in the staging folder after sync,
-after the repository's `tinycd.toml` has been read. A non-zero exit discards
+after the repository's `.tinycd/config.toml` has been read. A non-zero exit discards
 the staging folder and keeps the previous release running. May come from the
 repository's file.
 

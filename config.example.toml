@@ -1,4 +1,5 @@
-# In a tinycd.toml committed to the deployed repository, only shell, env,
+# tinycd configuration; lives at .tinycd/config.toml in the tracked
+# directory. In a copy committed to the deployed repository, only shell, env,
 # install, and start are used; the rest come from the machine running tinycd.
 
 # Git URL or an existing remote name. Defaults to origin.
@@ -8,11 +9,11 @@ repo = "git@github.com:example/app.git"
 poll = 30
 # hook = "127.0.0.1:8080"
 
-# Where deployments live; paths are relative to this file. Defaults to this
-# file's directory when tinycd is given a Git URL, or ~/.tinycd/<name>-<hash>
-# when it tracks a checkout.
-root = ".tinycd"
-interlock = ".tinycd/interlock"
+# Where deployments live; relative paths resolve against this file's
+# directory, so "." keeps them inside .tinycd/. Defaults to <dir>/.tinycd for
+# a Git URL, or ~/.tinycd/<name>-<hash> when tracking a checkout.
+root = "."
+interlock = "interlock"
 
 # Shell that runs the commands. Defaults to sh -c, or cmd /C on Windows.
 # shell = ["powershell", "-NoProfile", "-Command"]
@@ -25,7 +26,7 @@ start = "npm start"
 # Retain enough releases for quick rollback without filling a home computer.
 keep = 5
 
-# Prefer TINYCD_TOKEN. If stored here, run: chmod 600 tinycd.toml
+# Prefer TINYCD_TOKEN. If stored here, run: chmod 600 config.toml
 # token = "replace-with-at-least-32-random-ASCII-characters"
 
 # Extra environment for sync, install, and start. Keep this table last:

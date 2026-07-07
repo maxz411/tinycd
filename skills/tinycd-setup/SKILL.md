@@ -31,12 +31,12 @@ tinycd git@github.com:example/app.git ~/apps/example
 ```
 
 - The directory defaults to the current one and is created if missing.
-- Deployments live directly in that directory: `current`, `head`, `lock`,
-  `deployments/`.
+- Everything lands in `<dir>/.tinycd/`: `config.toml`, `current`, `head`,
+  `lock`, and `deployments/`.
 - The deployment recipe (`install`, `start`, `shell`, `[env]`) is read from
-  the `tinycd.toml` committed to the repository, re-read from every synced
+  the `.tinycd/config.toml` committed to the repository, re-read from every synced
   release, so pushing a config change takes effect on the next deployment.
-- tinycd writes a two-line `tinycd.toml` into the directory recording the URL,
+- tinycd writes a small `.tinycd/config.toml` into the directory recording the URL,
   so a plain `tinycd` run there later resumes the same deployment. It never
   overwrites a file the user authored (only files starting with
   `# Written by tinycd` are refreshed).
@@ -55,9 +55,14 @@ tinycd ~/code/app # or point at it
 - Commit and push from the checkout, or push from anywhere else — polling
   watches the remote, not the working tree, so both deploy. Uncommitted local
   changes are never deployed.
+- If no `.tinycd/config.toml` exists yet and the terminal is interactive, a
+  full-screen setup wizard runs first: it confirms the detected remote,
+  suggests install/start commands from the project type, asks where releases
+  should live, and writes the config before starting. Non-interactive runs
+  (systemd, CI) skip the wizard and fail with a clear error instead.
 
-A first run deploys immediately; there is no separate "init" step. The
-startup output prints which repository is tracked and where the root is.
+A first run deploys immediately. The startup output prints which repository
+is tracked and where the root is.
 
 Anything that looks like `scheme://…` or scp-style `host:path` is treated as
 a URL; anything else must be an existing directory. `--repo` cannot be
@@ -128,9 +133,10 @@ records the last deployed commit).
 - **Pause**: create the interlock file (`<root>/interlock` by default);
   tinycd waits before syncing or restarting until it is removed. Access
   errors on the interlock fail closed.
-- **Stop**: Ctrl+C or SIGTERM. The release's whole process group gets SIGTERM
-  (Ctrl+Break on Windows), then SIGKILL after a 10-second grace period. On
-  Windows a job object guarantees nothing outlives tinycd.
+- **Stop**: Ctrl+C, SIGTERM, or SIGHUP (closing the terminal). The release's
+  whole process group gets SIGTERM (Ctrl+Break on Windows), then SIGKILL
+  after a 10-second grace period. On Windows a job object guarantees nothing
+  outlives tinycd.
 - **Roll back**: the reliable path is `git revert` + push — tinycd deploys the
   revert like any commit. For a manual rollback: stop tinycd, repoint
   `<root>/current` at an older folder under `<root>/deployments/`, start
@@ -148,9 +154,9 @@ instance pointed at the same root exits immediately instead of interfering.
 | Error | Meaning / fix |
 |---|---|
 | `another tinycd is already managing <root>` | A live instance holds `<root>/lock`. Find it (`pgrep -fl tinycd`) and stop it, or you meant a different project. |
-| `<dir> is not a Git checkout with an origin remote` | Local mode needs `origin`, or set `repo` in `tinycd.toml`, or pass a Git URL instead. |
+| `<dir> is not a Git checkout with an origin remote` | Local mode needs `origin`, or set `repo` in `.tinycd/config.toml`, or pass a Git URL instead. |
 | `<arg> is neither an existing directory nor a Git URL` | Typo in the path, or the URL lacks a scheme/`host:path` shape. |
-| `start is not configured; …` (at deploy time) | No `start` on the CLI, in the local file, or in the repository's `tinycd.toml`. Commit one to the repo or pass `--start`. |
-| `…contains a token and must not be readable by group or other users` | `chmod 600 tinycd.toml`, or move the token to `TINYCD_TOKEN`. |
+| `start is not configured; …` (at deploy time) | No `start` on the CLI, in the local file, or in the repository's `.tinycd/config.toml`. Commit one to the repo or pass `--start`. |
+| `…contains a token and must not be readable by group or other users` | `chmod 600 .tinycd/config.toml`, or move the token to `TINYCD_TOKEN`. |
 | `failed to listen on <address>` | Another process (often another tinycd) owns that hook port; pick a unique address per instance. |
 | `hook mode requires --token, …` | Webhooks never run unauthenticated; generate a token first. |

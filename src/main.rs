@@ -1,5 +1,8 @@
+mod setup;
+
 use std::{
     collections::BTreeMap,
+    io::IsTerminal,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -49,7 +52,7 @@ struct Cli {
     #[arg(value_name = "DIR")]
     dir: Option<PathBuf>,
 
-    /// Config file. Defaults to tinycd.toml in the tracked directory.
+    /// Config file. Defaults to .tinycd/config.toml in the tracked directory.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -177,9 +180,9 @@ impl Overrides {
 impl Config {
     /// Merge the CLI over the local config file over the built-in defaults.
     /// Settings that describe the project itself may also come from the
-    /// tinycd.toml inside the repository; those are merged per release.
-    async fn load(cli: Cli) -> Result<Self, Error> {
-        let mode = Mode::resolve(cli.source, cli.dir)?;
+    /// .tinycd/config.toml inside the repository; those are merged per
+    /// release.
+    async fn load(cli: Cli, mode: Mode) -> Result<Self, Error> {
         if cli.repo.is_some() && matches!(mode, Mode::Url { .. }) {
             return Err(
                 "pass the repository as either the first argument or --repo, not both".into(),
@@ -194,7 +197,9 @@ impl Config {
         };
 
         let required = cli.config.is_some();
-        let path = cli.config.unwrap_or_else(|| project.join("tinycd.toml"));
+        let path = cli
+            .config
+            .unwrap_or_else(|| project.join(".tinycd").join("config.toml"));
         let dir = path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
@@ -227,7 +232,9 @@ impl Config {
 
         let token = cli.token.or(file.token);
         if hook.is_some() && token.is_none() {
-            return Err("hook mode requires --token, TINYCD_TOKEN, or token in tinycd.toml".into());
+            return Err(
+                "hook mode requires --token, TINYCD_TOKEN, or token in .tinycd/config.toml".into(),
+            );
         }
         if token.as_ref().is_some_and(|token| {
             token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic())
@@ -252,7 +259,7 @@ impl Config {
             (None, Some(root)) => resolve(root),
             (None, None) => match &mode {
                 Mode::Local { project } => state_root(project)?,
-                Mode::Url { home, .. } => home.clone(),
+                Mode::Url { home, .. } => home.join(".tinycd"),
             },
         };
         let interlock = cli
@@ -417,7 +424,8 @@ fn state_root(project: &Path) -> Result<PathBuf, Error> {
 fn write_local_config(home: &Path, repo: &str) -> Result<(), Error> {
     const MARKER: &str = "# Written by tinycd";
 
-    let path = home.join("tinycd.toml");
+    let dir = home.join(".tinycd");
+    let path = dir.join("config.toml");
     let repo = repo.replace('\\', r"\\").replace('"', "\\\"");
     let contents = format!(
         "{MARKER}; running `tinycd` in this directory resumes the deployment.\n\
@@ -429,6 +437,8 @@ fn write_local_config(home: &Path, repo: &str) -> Result<(), Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("failed to read {}: {error}", path.display()).into()),
     }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
     std::fs::write(&path, contents)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
     println!("wrote {}", path.display());
@@ -484,7 +494,7 @@ async fn repo_url(configured: Option<String>, dir: &Path) -> Result<String, Erro
         }
         _ => Ok(configured.ok_or_else(|| {
             format!(
-                "{} is not a Git checkout with an origin remote; pass a Git URL or set repo in tinycd.toml",
+                "{} is not a Git checkout with an origin remote; pass a Git URL or set repo in .tinycd/config.toml",
                 dir.display()
             )
         })?),
@@ -516,8 +526,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Error> {
+    let mut cli = Cli::parse();
+    let mode = Mode::resolve(cli.source.take(), cli.dir.take())?;
+
+    // First run in an unconfigured checkout on an interactive terminal:
+    // guide the user through setup instead of failing on a missing start.
+    if let Mode::Local { project } = &mode
+        && cli.config.is_none()
+        && cli.start.is_none()
+        && !project.join(".tinycd").join("config.toml").exists()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        let origin = repo_url(None, project).await.ok();
+        let Some(answers) = setup::run(project, origin.as_deref())? else {
+            println!("setup cancelled; run tinycd here again to retry");
+            return Ok(());
+        };
+        let path = setup::write_config(project, &answers)?;
+        println!("wrote {}", path.display());
+    }
+
     let app = App {
-        config: Arc::new(Config::load(Cli::parse()).await?),
+        config: Arc::new(Config::load(cli, mode).await?),
         running: Arc::default(),
     };
     let _lock = lock_root(&app.config.root)?;
@@ -550,16 +581,22 @@ async fn run() -> Result<(), Error> {
     }
 }
 
-/// Wait for Ctrl+C, SIGTERM on Unix, or a console close or system shutdown on
-/// Windows.
+/// Wait for Ctrl+C, SIGTERM or SIGHUP on Unix, or a console close or system
+/// shutdown on Windows. SIGHUP arrives when the terminal that started tinycd
+/// closes; without stopping, the release would outlive tinycd unmanaged.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install the SIGTERM handler");
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut term =
+            signal(SignalKind::terminate()).expect("failed to install the SIGTERM handler");
+        let mut hangup =
+            signal(SignalKind::hangup()).expect("failed to install the SIGHUP handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            _ = hangup.recv() => {}
         }
     }
 
@@ -765,10 +802,10 @@ struct RunSpec {
     start: String,
 }
 
-/// Merge the local overrides with the tinycd.toml inside a synced release.
-/// Launcher-level settings in the repository's file are ignored.
+/// Merge the local overrides with the .tinycd/config.toml inside a synced
+/// release. Launcher-level settings in the repository's file are ignored.
 async fn run_spec(config: &Config, release: &Path) -> Result<RunSpec, Error> {
-    let file = FileConfig::load(&release.join("tinycd.toml"), false).await?;
+    let file = FileConfig::load(&release.join(".tinycd").join("config.toml"), false).await?;
     let overrides = &config.overrides;
 
     let shell = overrides.resolve_shell(file.shell);
@@ -783,7 +820,7 @@ async fn run_spec(config: &Config, release: &Path) -> Result<RunSpec, Error> {
         env,
         install: overrides.install.clone().or(file.install),
         start: overrides.start.clone().or(file.start).ok_or(
-            "start is not configured; set it in the repository's tinycd.toml, the local tinycd.toml, or with --start",
+            "start is not configured; set it in .tinycd/config.toml (committed or local) or with --start",
         )?,
     })
 }

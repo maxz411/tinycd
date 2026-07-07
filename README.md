@@ -30,7 +30,7 @@ from source instead, run `cargo install --path .` from a checkout.
 
 ## Quick start
 
-Commit a `tinycd.toml` to the project being deployed:
+Commit a `.tinycd/config.toml` to the project being deployed:
 
 ```toml
 install = "npm ci"
@@ -43,9 +43,9 @@ Then point tinycd at the project's Git URL and a directory to deploy into:
 tinycd git@github.com:example/app.git ~/apps/example
 ```
 
-tinycd clones the repository, reads `tinycd.toml` from the clone, installs
+tinycd clones the repository, reads `.tinycd/config.toml` from the clone, installs
 and starts it, and redeploys whenever the remote changes. The directory
-defaults to the current one, and a small `tinycd.toml` recording the URL is
+defaults to the current one, and a small `.tinycd/config.toml` recording the URL is
 written into it, so `tinycd ~/apps/example` (or a plain `tinycd` inside it)
 restarts the same deployment after a reboot.
 
@@ -59,7 +59,9 @@ tinycd ~/code/app # track that checkout's origin
 Deployments then live under `~/.tinycd/<name>-<hash>` instead of the working
 tree, so the checkout stays an ordinary place to work: commit and push from
 it, or push from another machine, and tinycd deploys the new commit either
-way.
+way. If the checkout has no config yet and the terminal is interactive, a
+setup wizard walks through creating `.tinycd/config.toml` — detected remote,
+suggested install and start commands, and where releases should live.
 
 With no other configuration, tinycd polls the remote every 30 seconds,
 shallow-clones new releases, keeps five releases, and uses `<root>/interlock`
@@ -78,30 +80,30 @@ keep = 5
 ```
 
 `root` — the folder holding the deployments and the `current` link — defaults
-to the deployment directory when tinycd is given a Git URL, and to
-`~/.tinycd/<name>-<hash>` when it tracks a checkout. `repo` defaults to the
-tracked checkout's `origin`. `hook` and `install` are disabled by default.
-`start` has no default because guessing how to launch an arbitrary project
-would be unsafe.
+to `<dir>/.tinycd` when tinycd is given a Git URL, and to
+`~/.tinycd/<name>-<hash>` when it tracks a checkout, so `.tinycd/` is
+tinycd's one footprint either way. `repo` defaults to the tracked checkout's
+`origin`. `hook` and `install` are disabled by default. `start` has no
+default because guessing how to launch an arbitrary project would be unsafe.
 
 ## Configuration
 
-tinycd reads up to two config files: the local `tinycd.toml` in the tracked
-directory (or the file named by `--config`), and the `tinycd.toml` inside the
+tinycd reads up to two config files: the local `.tinycd/config.toml` in the tracked
+directory (or the file named by `--config`), and the `.tinycd/config.toml` inside the
 repository, re-read from every synced release. The repository's file provides
 `shell`, `env`, `install`, and `start`, so a project carries its own
 deployment recipe and changes take effect on the next deployment. Everything
 else — what to watch and where to keep releases — only comes from the machine
 running tinycd.
 
-All runtime settings can be placed in the local `tinycd.toml`:
+All runtime settings can be placed in the local `.tinycd/config.toml`:
 
 ```toml
 repo = "git@github.com:example/app.git"
 poll = 30
 hook = "127.0.0.1:8080"
-root = ".tinycd"
-interlock = ".tinycd/interlock"
+root = "."
+interlock = "interlock"
 shell = ["sh", "-c"]
 sync = 'git clone --depth 1 "$TINYCD_REPO" .'
 install = "npm ci"
@@ -112,11 +114,12 @@ keep = 5
 PYTHONPATH = "/home/me/code"
 ```
 
-See [tinycd.example.toml](tinycd.example.toml) for a copyable file. CLI values
+See [config.example.toml](config.example.toml) for a copyable file. CLI values
 and `TINYCD_TOKEN` override the local file, the local file overrides the
 repository's file, and both override built-in defaults; `--env KEY=VALUE`
 entries override matching `[env]` keys. Relative paths in a local file are
-resolved relative to the file's directory.
+resolved relative to the file's directory — `.tinycd/` — so `root = "."`
+keeps releases inside `.tinycd/` itself.
 
 The default files are optional. Passing `--config <path>` makes that specific
 file required. Unknown settings and invalid values are rejected.
@@ -154,7 +157,7 @@ curl -X POST \
   http://localhost:8080/deploy
 ```
 
-A token may be placed in `tinycd.toml`, but on Unix the file must not be
+A token may be placed in `.tinycd/config.toml`, but on Unix the file must not be
 readable by group or other users. Use HTTPS through a reverse proxy whenever
 the webhook crosses an untrusted network. Tokens and repository URLs supplied
 to the sync command are removed from install and start environments.
@@ -186,8 +189,9 @@ deployments are cleaned up on the next deployment. Successful releases beyond
 the deployed commit so restarts pick up where the last run stopped.
 
 The start command runs in its own process group. When a new release is ready,
-or when tinycd itself receives Ctrl+C or SIGTERM, the whole group receives
-SIGTERM; anything still running ten seconds later receives SIGKILL.
+or when tinycd itself receives Ctrl+C, SIGTERM, or SIGHUP (the terminal that
+started it closed), the whole group receives SIGTERM; anything still running
+ten seconds later receives SIGKILL.
 
 Create the interlock file to pause before syncing or restarting, then remove it
 to continue:
