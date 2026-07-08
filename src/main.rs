@@ -30,6 +30,12 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// How long a stopping release gets to exit gracefully before it is killed.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
+/// How long a started server must stay up to count as running.
+const DRY_RUN_WINDOW: Duration = Duration::from_secs(3);
+
+/// How long a configured check command gets to pass, retrying every second.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Parser)]
 #[command(
     version,
@@ -81,6 +87,19 @@ struct Cli {
     #[arg(long, value_name = "REMOTE")]
     repo: Option<String>,
 
+    /// Branch or tag to poll and clone instead of the remote HEAD.
+    #[arg(long = "ref", value_name = "REF")]
+    git_ref: Option<String>,
+
+    /// Path linked into each release from <root>/shared; repeatable. A
+    /// trailing slash marks a directory that does not exist yet.
+    #[arg(long, value_name = "PATH")]
+    share: Vec<String>,
+
+    /// Command that must exit 0 before a started release replaces current.
+    #[arg(long)]
+    check: Option<String>,
+
     /// File that pauses syncs and restarts while it exists.
     #[arg(long, value_name = "PATH")]
     interlock: Option<PathBuf>,
@@ -113,6 +132,25 @@ struct Cli {
     /// Number of successful deployments to retain.
     #[arg(long)]
     keep: Option<usize>,
+
+    /// Sync, install, and start one release as a test, verify it stays up
+    /// briefly, then stop it and exit without touching the deployed state.
+    #[arg(long, conflicts_with_all = ["status", "rollback"])]
+    dry_run: bool,
+
+    /// Show the deployed state and exit.
+    #[arg(long, conflicts_with = "rollback")]
+    status: bool,
+
+    /// Repoint current at an earlier release and exit; stop tinycd first.
+    /// Without a value, the release before the current one is used.
+    #[arg(
+        long,
+        value_name = "ID",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    rollback: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -122,6 +160,9 @@ struct FileConfig {
     hook: Option<SocketAddr>,
     token: Option<String>,
     repo: Option<String>,
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+    share: Option<Vec<String>>,
     interlock: Option<PathBuf>,
     root: Option<PathBuf>,
     shell: Option<Vec<String>>,
@@ -129,8 +170,28 @@ struct FileConfig {
     sync: Option<String>,
     install: Option<String>,
     start: Option<String>,
+    check: Option<String>,
     keep: Option<usize>,
 }
+
+/// Setting names that signal a misplaced key inside the [env] table.
+const SETTING_NAMES: [&str; 15] = [
+    "poll",
+    "hook",
+    "token",
+    "repo",
+    "ref",
+    "share",
+    "interlock",
+    "root",
+    "shell",
+    "sync",
+    "install",
+    "start",
+    "check",
+    "keep",
+    "env",
+];
 
 impl FileConfig {
     async fn load(path: &Path, required: bool) -> Result<Self, Error> {
@@ -149,9 +210,14 @@ impl FileConfig {
 struct Config {
     poll: Option<u64>,
     hook: Option<SocketAddr>,
-    /// SHA-256 of the webhook bearer token.
-    token: Option<[u8; 32]>,
+    /// The webhook secret, kept raw because the GitHub scheme signs the
+    /// request body with it.
+    token: Option<String>,
     repo: String,
+    /// Branch or tag to poll and clone; the remote HEAD when unset.
+    git_ref: Option<String>,
+    /// Paths linked into each release from <root>/shared after sync.
+    share: Vec<String>,
     interlock: PathBuf,
     root: PathBuf,
     sync: String,
@@ -167,6 +233,7 @@ struct Overrides {
     env: BTreeMap<String, String>,
     install: Option<String>,
     start: Option<String>,
+    check: Option<String>,
 }
 
 impl Overrides {
@@ -277,6 +344,17 @@ impl Config {
         }
 
         let mut env = file.env;
+        // A tinycd setting inside [env] is almost always a misplaced key:
+        // everything below the table header lands in the table.
+        for key in env.keys() {
+            if SETTING_NAMES.contains(&key.as_str()) {
+                return Err(format!(
+                    "[env] contains '{key}', which is a tinycd setting; move it above the \
+                     [env] table, or pass --env {key}=... for a variable really named that"
+                )
+                .into());
+            }
+        }
         for pair in cli.env {
             match pair.split_once('=') {
                 Some((key, value)) if !key.is_empty() => {
@@ -286,10 +364,12 @@ impl Config {
             }
         }
 
-        let default_sync = if cfg!(windows) {
-            r#"git clone --depth 1 "%TINYCD_REPO%" ."#
-        } else {
-            r#"git clone --depth 1 "$TINYCD_REPO" ."#
+        let git_ref = cli.git_ref.or(file.git_ref);
+        let default_sync = match (cfg!(windows), git_ref.is_some()) {
+            (false, false) => r#"git clone --depth 1 "$TINYCD_REPO" ."#,
+            (false, true) => r#"git clone --depth 1 --branch "$TINYCD_REF" "$TINYCD_REPO" ."#,
+            (true, false) => r#"git clone --depth 1 "%TINYCD_REPO%" ."#,
+            (true, true) => r#"git clone --depth 1 --branch "%TINYCD_REF%" "%TINYCD_REPO%" ."#,
         };
 
         let keep = cli.keep.or(file.keep).unwrap_or(5);
@@ -302,11 +382,29 @@ impl Config {
             Mode::Local { .. } => repo_url(cli.repo.or(file.repo), &project).await?,
         };
 
+        let mut share = if cli.share.is_empty() {
+            file.share.unwrap_or_default()
+        } else {
+            cli.share
+        };
+        for entry in &mut share {
+            let trimmed = entry.trim_end_matches(['/', '\\']);
+            if trimmed.is_empty()
+                || Path::new(trimmed)
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(format!("share entry {entry:?} must be a relative path").into());
+            }
+        }
+
         Ok(Self {
             poll,
             hook,
-            token: token.map(|token| Sha256::digest(token.as_bytes()).into()),
+            token,
             repo,
+            git_ref,
+            share,
             interlock,
             root,
             sync: cli
@@ -319,6 +417,7 @@ impl Config {
                 env,
                 install: cli.install.or(file.install),
                 start: cli.start.or(file.start),
+                check: cli.check.or(file.check),
             },
         })
     }
@@ -475,7 +574,8 @@ fn git(args: &[&str]) -> Command {
     command
         .args(args)
         .env_remove("TINYCD_TOKEN")
-        .env_remove("TINYCD_REPO");
+        .env_remove("TINYCD_REPO")
+        .env_remove("TINYCD_REF");
     command
 }
 
@@ -534,6 +634,8 @@ async fn run() -> Result<(), Error> {
     if let Mode::Local { project } = &mode
         && cli.config.is_none()
         && cli.start.is_none()
+        && !cli.status
+        && cli.rollback.is_none()
         && !project.join(".tinycd").join("config.toml").exists()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
@@ -547,8 +649,22 @@ async fn run() -> Result<(), Error> {
         println!("wrote {}", path.display());
     }
 
+    let show_status = cli.status;
+    let rollback_to = cli.rollback.clone();
+    let dry = cli.dry_run;
+    let config = Config::load(cli, mode).await?;
+    if show_status {
+        return status(&config).await;
+    }
+    if let Some(target) = rollback_to {
+        return rollback(&config, &target).await;
+    }
+    if dry {
+        return dry_run(&config).await;
+    }
+
     let app = App {
-        config: Arc::new(Config::load(cli, mode).await?),
+        config: Arc::new(config),
         running: Arc::default(),
     };
     let _lock = lock_root(&app.config.root)?;
@@ -643,9 +759,12 @@ async fn resume(app: &App) -> Result<(), Error> {
         .map(|head| head.trim().to_owned())
         .filter(|head| !head.is_empty());
     let spec = run_spec(config, &current).await?;
-    println!("running start: {}", spec.start);
+    let resolved = tokio::fs::canonicalize(&current).await?;
+    let id = resolved.file_name().unwrap_or_default().to_string_lossy();
+    let log = open_log(&release_log(&config.root, &id)).await;
+    banner(log.as_ref(), &format!("running start: {}", spec.start));
     *app.running.lock().await = Running {
-        server: Some(start_server(&spec, &current)?),
+        server: Some(start_server(&spec, &current, log.as_ref())?),
         head,
     };
     Ok(())
@@ -653,7 +772,7 @@ async fn resume(app: &App) -> Result<(), Error> {
 
 async fn poll(app: App, seconds: u64) -> Result<(), Error> {
     loop {
-        match remote_head(&app.config.repo).await {
+        match remote_head(&app.config.repo, app.config.git_ref.as_deref()).await {
             Ok(next) => {
                 let head = app.running.lock().await.head.clone();
                 let outdated = match &head {
@@ -679,8 +798,12 @@ async fn poll(app: App, seconds: u64) -> Result<(), Error> {
     }
 }
 
-async fn remote_head(repo: &str) -> Result<String, Error> {
-    let output = git(&["ls-remote", repo, "HEAD"]).output().await?;
+/// The commit the configured ref (or HEAD) points at on the remote. Branches
+/// sort before tags in ls-remote output, so a name naming both picks the
+/// branch.
+async fn remote_head(repo: &str, git_ref: Option<&str>) -> Result<String, Error> {
+    let target = git_ref.unwrap_or("HEAD");
+    let output = git(&["ls-remote", repo, target]).output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -696,7 +819,7 @@ async fn remote_head(repo: &str) -> Result<String, Error> {
         .next()
     {
         Some(head) => Ok(head.to_owned()),
-        None => Err(format!("{repo} has no HEAD").into()),
+        None => Err(format!("{repo} has no ref {target}").into()),
     }
 }
 
@@ -704,23 +827,25 @@ async fn serve(app: App, address: SocketAddr) -> Result<(), Error> {
     let router = Router::new()
         .route(
             "/deploy",
-            post(|State(app): State<App>, headers: HeaderMap| async move {
-                if !authorized(&headers, app.config.token.as_ref()) {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        [(header::WWW_AUTHENTICATE, "Bearer")],
-                        "unauthorized",
-                    )
-                        .into_response();
-                }
-
-                match deploy(&app).await {
-                    Ok(()) => (StatusCode::OK, "deployed").into_response(),
-                    Err(error) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            post(
+                |State(app): State<App>, headers: HeaderMap, body: axum::body::Bytes| async move {
+                    if !authorized(&headers, &body, app.config.token.as_deref()) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [(header::WWW_AUTHENTICATE, "Bearer")],
+                            "unauthorized",
+                        )
+                            .into_response();
                     }
-                }
-            }),
+
+                    match deploy(&app).await {
+                        Ok(()) => (StatusCode::OK, "deployed").into_response(),
+                        Err(error) => {
+                            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        }
+                    }
+                },
+            ),
         )
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(address)
@@ -732,18 +857,83 @@ async fn serve(app: App, address: SocketAddr) -> Result<(), Error> {
     Ok(())
 }
 
-fn authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
-    let Some(expected) = expected else {
+/// Accept the token however the sender can deliver it: a bearer header, a
+/// GitLab webhook's X-Gitlab-Token, or a GitHub webhook's HMAC signature of
+/// the body. Comparisons run over digests in constant time.
+fn authorized(headers: &HeaderMap, body: &[u8], token: Option<&str>) -> bool {
+    let Some(token) = token else {
         return false;
     };
-    headers
+    let expected: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+
+    if let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once(' '))
-        .is_some_and(|(scheme, token)| {
-            let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-            scheme.eq_ignore_ascii_case("bearer") && bool::from(digest.ct_eq(expected))
-        })
+        && let Some((scheme, presented)) = value.split_once(' ')
+        && scheme.eq_ignore_ascii_case("bearer")
+    {
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        if bool::from(digest.ct_eq(&expected)) {
+            return true;
+        }
+    }
+
+    if let Some(presented) = headers
+        .get("x-gitlab-token")
+        .and_then(|value| value.to_str().ok())
+    {
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        if bool::from(digest.ct_eq(&expected)) {
+            return true;
+        }
+    }
+
+    if let Some(value) = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        && let Some(hex) = value.strip_prefix("sha256=")
+        && let Some(signature) = decode_hex32(hex)
+    {
+        let computed = hmac_sha256(token.as_bytes(), body);
+        if bool::from(signature.ct_eq(&computed)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// HMAC-SHA256 (RFC 2104) over the sha2 crate; the textbook two-pass
+/// construction, kept inline to avoid a dependency.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(block.map(|byte| byte ^ 0x36));
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(block.map(|byte| byte ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (index, pair) in hex.chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        bytes[index] = (high * 16 + low) as u8;
+    }
+    Some(bytes)
 }
 
 async fn deploy(app: &App) -> Result<(), Error> {
@@ -751,31 +941,53 @@ async fn deploy(app: &App) -> Result<(), Error> {
     let mut running = app.running.lock().await;
 
     wait_for_interlock(&config.interlock).await?;
-    let head = remote_head(&config.repo).await?;
+    let head = remote_head(&config.repo, config.git_ref.as_deref()).await?;
 
     let id = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
         .to_string();
     let deployments = config.root.join("deployments");
-    let staging = deployments.join(format!(".{id}"));
     let release = deployments.join(&id);
+    // Releases are built under their final name: renaming a folder after
+    // install would break the absolute paths that Python and Node tooling
+    // bake into virtualenvs and shebangs. The marker distinguishes a
+    // completed release from one interrupted mid-build.
+    let marker = deployments.join(format!(".incomplete-{id}"));
     tokio::fs::create_dir_all(&deployments).await?;
-    tokio::fs::create_dir(&staging).await?;
+    tokio::fs::write(&marker, "").await?;
+    tokio::fs::create_dir(&release).await?;
+    let log_path = release_log(&config.root, &id);
+    let log = open_log(&log_path).await;
+    let cite = |error: Error| format!("{error} (log: {})", log_path.display());
 
-    let spec = match build(config, &staging, &release).await {
+    let spec = match build(config, &release, log.as_ref()).await {
         Ok(spec) => spec,
         Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(error);
+            let _ = tokio::fs::remove_dir_all(&release).await;
+            let _ = tokio::fs::remove_file(&marker).await;
+            return Err(cite(error).into());
         }
     };
+
+    // The interlock may have appeared during a slow install; recheck before
+    // touching the running server.
+    wait_for_interlock(&config.interlock).await?;
+    tokio::fs::remove_file(&marker).await?;
 
     if let Some(server) = running.server.take() {
         server.stop().await?;
     }
-    println!("running start: {}", spec.start);
-    running.server = Some(start_server(&spec, &release)?);
+    banner(log.as_ref(), &format!("running start: {}", spec.start));
+    let server = start_server(&spec, &release, log.as_ref())?;
+    match verify_start(server, &spec, &release, log.as_ref()).await {
+        Ok(server) => running.server = Some(server),
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&release).await;
+            restart_previous(config, &mut running).await;
+            return Err(cite(error).into());
+        }
+    }
 
     if let Err(error) = point_current(&config.root, &id) {
         if let Some(server) = running.server.take() {
@@ -789,17 +1001,245 @@ async fn deploy(app: &App) -> Result<(), Error> {
     running.head = Some(head);
 
     prune(&deployments, &release, config.keep).await;
+    prune_logs(&config.root.join("logs"), config.keep).await;
     println!("deployed {}", release.display());
     Ok(())
 }
 
-/// How to install and start one release: the repository's tinycd.toml
-/// provides the values, and the CLI or the local config file override them.
+/// A started release must stay up for DRY_RUN_WINDOW, and pass the check
+/// command within CHECK_TIMEOUT when one is configured. Returns the server
+/// still running; on failure nothing is left running.
+async fn verify_start(
+    mut server: Server,
+    spec: &RunSpec,
+    release: &Path,
+    log: Option<&std::fs::File>,
+) -> Result<Server, Error> {
+    if let Ok(status) = tokio::time::timeout(DRY_RUN_WINDOW, server.child.wait()).await {
+        return Err(format!(
+            "the server exited with {} within {} seconds of starting",
+            status?,
+            DRY_RUN_WINDOW.as_secs()
+        )
+        .into());
+    }
+
+    if let Some(check) = &spec.check {
+        banner(log, &format!("running check: {check}"));
+        let deadline = std::time::Instant::now() + CHECK_TIMEOUT;
+        loop {
+            if let Some(status) = server.child.try_wait()? {
+                return Err(format!("the server exited with {status} during the check").into());
+            }
+            let mut process = shell_command(&spec.shell, &spec.env, check, release);
+            redirect(&mut process, log)?;
+            if process.status().await?.success() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = server.stop().await;
+                return Err(format!(
+                    "the check command did not pass within {} seconds",
+                    CHECK_TIMEOUT.as_secs()
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    Ok(server)
+}
+
+/// Build and start one throwaway release under <root>/.dry-run-<id>, verify
+/// it the same way a deployment would, then stop it. The deployed state —
+/// current, head, releases, the lock — is never touched, so a dry run is
+/// safe next to a live instance (though the started server may contend for
+/// the same port).
+async fn dry_run(config: &Config) -> Result<(), Error> {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
+    let scratch = config.root.join(format!(".dry-run-{id}"));
+    let release = scratch.join("release");
+    tokio::fs::create_dir_all(&release).await?;
+
+    let result = async {
+        let spec = build(config, &release, None).await?;
+        banner(None, &format!("running start: {}", spec.start));
+        let server = start_server(&spec, &release, None)?;
+        let server = verify_start(server, &spec, &release, None).await?;
+        server.stop().await?;
+        Ok::<(), Error>(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&scratch).await;
+    result?;
+    println!(
+        "dry run passed: the release built, started, stayed up for {} seconds, and stopped cleanly",
+        DRY_RUN_WINDOW.as_secs()
+    );
+    Ok(())
+}
+
+/// Print the deployed state as recorded on disk; works while a daemon runs.
+async fn status(config: &Config) -> Result<(), Error> {
+    println!("repo     {}", config.repo);
+    if let Some(git_ref) = &config.git_ref {
+        println!("ref      {git_ref}");
+    }
+    println!("root     {}", config.root.display());
+
+    match tokio::fs::canonicalize(config.root.join("current")).await {
+        Ok(resolved) => {
+            let id = resolved
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let age = id
+                .parse::<u64>()
+                .ok()
+                .and_then(|millis| {
+                    let deployed = UNIX_EPOCH + Duration::from_millis(millis);
+                    SystemTime::now().duration_since(deployed).ok()
+                })
+                .map(|age| format!(" (deployed {} ago)", format_age(age)))
+                .unwrap_or_default();
+            println!("current  {id}{age}");
+            if let Ok(head) = tokio::fs::read_to_string(config.root.join("head")).await {
+                println!("commit   {}", head.trim());
+            }
+            let log = release_log(&config.root, &id);
+            if tokio::fs::metadata(&log).await.is_ok() {
+                println!("log      {}", log.display());
+            }
+        }
+        Err(_) => println!("current  none (never deployed)"),
+    }
+
+    let mut releases = 0;
+    if let Ok(mut entries) = tokio::fs::read_dir(config.root.join("deployments")).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.is_ok_and(|kind| kind.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                releases += 1;
+            }
+        }
+    }
+    println!("releases {releases} retained");
+
+    // Probing the lock without blocking tells us whether a daemon is live.
+    let running = match std::fs::File::open(config.root.join("lock")) {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    };
+    println!(
+        "daemon   {}",
+        if running { "running" } else { "not running" }
+    );
+    Ok(())
+}
+
+fn format_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86400 => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+        _ => format!("{}d {}h", seconds / 86400, (seconds % 86400) / 3600),
+    }
+}
+
+/// Repoint current at an earlier complete release; the daemon must not be
+/// running. head is left alone so the rollback survives until the remote
+/// actually changes, and the next tinycd run starts the rolled-back release.
+async fn rollback(config: &Config, target: &str) -> Result<(), Error> {
+    let _lock =
+        lock_root(&config.root).map_err(|error| format!("{error}; stop it before rolling back"))?;
+
+    let deployments = config.root.join("deployments");
+    let mut releases = Vec::new();
+    let mut entries = tokio::fs::read_dir(&deployments)
+        .await
+        .map_err(|_| "nothing has been deployed yet")?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let complete = !name.starts_with('.')
+            && entry.file_type().await.is_ok_and(|kind| kind.is_dir())
+            && tokio::fs::metadata(deployments.join(format!(".incomplete-{name}")))
+                .await
+                .is_err();
+        if complete {
+            releases.push(name);
+        }
+    }
+    releases.sort();
+
+    let id = if target.is_empty() {
+        let current = tokio::fs::canonicalize(config.root.join("current"))
+            .await
+            .map_err(|_| "nothing is deployed, so there is nothing to roll back")?;
+        let current = current
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        releases
+            .iter()
+            .rev()
+            .find(|id| **id < current)
+            .ok_or("no release older than the current one is retained")?
+            .clone()
+    } else {
+        releases
+            .iter()
+            .find(|id| *id == target)
+            .ok_or_else(|| {
+                format!(
+                    "release {target} is not retained; retained: {}",
+                    releases.join(", ")
+                )
+            })?
+            .clone()
+    };
+
+    point_current(&config.root, &id)?;
+    println!("current -> {id}; run tinycd to start it");
+    Ok(())
+}
+
+/// Bring the release that current points at back up after a failed deploy.
+async fn restart_previous(config: &Config, running: &mut Running) {
+    let current = config.root.join("current");
+    let Ok(resolved) = tokio::fs::canonicalize(&current).await else {
+        return;
+    };
+    let id = resolved.file_name().unwrap_or_default().to_string_lossy();
+    let log = open_log(&release_log(&config.root, &id)).await;
+    match run_spec(config, &current).await {
+        Ok(spec) => {
+            banner(log.as_ref(), "restarting the previous release");
+            match start_server(&spec, &current, log.as_ref()) {
+                Ok(server) => running.server = Some(server),
+                Err(error) => eprintln!("failed to restart the previous release: {error}"),
+            }
+        }
+        Err(error) => eprintln!("failed to restart the previous release: {error}"),
+    }
+}
+
+/// How to install, start, and check one release: the repository's
+/// tinycd.toml provides the values, and the CLI or the local config file
+/// override them.
 struct RunSpec {
     shell: Vec<String>,
     env: BTreeMap<String, String>,
     install: Option<String>,
     start: String,
+    check: Option<String>,
 }
 
 /// Merge the local overrides with the .tinycd/config.toml inside a synced
@@ -822,39 +1262,144 @@ async fn run_spec(config: &Config, release: &Path) -> Result<RunSpec, Error> {
         start: overrides.start.clone().or(file.start).ok_or(
             "start is not configured; set it in .tinycd/config.toml (committed or local) or with --start",
         )?,
+        check: overrides.check.clone().or(file.check),
     })
 }
 
-/// Run the sync and install commands in the staging folder, then promote it to
-/// a release folder once the interlock allows.
-async fn build(config: &Config, staging: &Path, release: &Path) -> Result<RunSpec, Error> {
-    println!("running sync: {}", config.sync);
+/// Run the sync and install commands in the release folder, linking shared
+/// paths in between. The folder already carries its final name; deploy()
+/// tracks completion with a marker file instead of a rename.
+async fn build(
+    config: &Config,
+    release: &Path,
+    log: Option<&std::fs::File>,
+) -> Result<RunSpec, Error> {
+    banner(log, &format!("running sync: {}", config.sync));
     let shell = config.overrides.resolve_shell(None);
-    let mut process = shell_command(&shell, &config.overrides.env, &config.sync, staging);
+    let mut process = shell_command(&shell, &config.overrides.env, &config.sync, release);
     process.env("TINYCD_REPO", &config.repo);
+    if let Some(git_ref) = &config.git_ref {
+        process.env("TINYCD_REF", git_ref);
+    }
+    redirect(&mut process, log)?;
     let status = process.status().await?;
     if !status.success() {
         return Err(format!("sync command exited with {status}").into());
     }
 
-    // Read the freshly synced repository's tinycd.toml, so install and start
+    if !config.share.is_empty() {
+        link_shared(&config.share, &config.root.join("shared"), release)?;
+    }
+
+    // Read the freshly synced repository's config, so install and start
     // follow the deployed commit.
-    let spec = run_spec(config, staging).await?;
+    let spec = run_spec(config, release).await?;
     if let Some(install) = &spec.install {
-        println!("running install: {install}");
-        let status = shell_command(&spec.shell, &spec.env, install, staging)
-            .status()
-            .await?;
+        banner(log, &format!("running install: {install}"));
+        let mut process = shell_command(&spec.shell, &spec.env, install, release);
+        redirect(&mut process, log)?;
+        let status = process.status().await?;
         if !status.success() {
             return Err(format!("install command exited with {status}").into());
         }
     }
-
-    // The interlock may have appeared during a slow install; recheck before
-    // touching the running server.
-    wait_for_interlock(&config.interlock).await?;
-    tokio::fs::rename(staging, release).await?;
     Ok(spec)
+}
+
+/// Symlink each shared entry from <shared> into the release, replacing
+/// whatever the sync produced at that path. Missing sources are created:
+/// entries with a trailing slash as directories, others as empty files. On
+/// Windows directories become junctions and files hard links, neither of
+/// which needs administrator rights.
+fn link_shared(entries: &[String], shared: &Path, release: &Path) -> Result<(), Error> {
+    for entry in entries {
+        let relative = entry.trim_end_matches(['/', '\\']);
+        let source = shared.join(relative);
+        let target = release.join(relative);
+
+        if !source.exists() {
+            if entry.ends_with(['/', '\\']) {
+                std::fs::create_dir_all(&source)?;
+            } else {
+                if let Some(parent) = source.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&source)?;
+                println!("created empty shared file {}", source.display());
+            }
+        }
+
+        if let Ok(existing) = std::fs::symlink_metadata(&target) {
+            if existing.is_dir() {
+                std::fs::remove_dir_all(&target)?;
+            } else {
+                std::fs::remove_file(&target)?;
+            }
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let source = std::path::absolute(&source)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &target)
+            .map_err(|error| format!("failed to link {}: {error}", target.display()))?;
+        #[cfg(windows)]
+        if source.is_dir() {
+            junction::create(&source, &target)
+                .map_err(|error| format!("failed to link {}: {error}", target.display()))?;
+        } else {
+            std::fs::hard_link(&source, &target)
+                .map_err(|error| format!("failed to link {}: {error}", target.display()))?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        return Err("share is not supported on this platform".into());
+    }
+    Ok(())
+}
+
+/// The per-release log file; sync, install, check, and start output lands
+/// here so failed deployments can be examined later.
+fn release_log(root: &Path, id: &str) -> PathBuf {
+    root.join("logs").join(format!("{id}.log"))
+}
+
+/// Open a release log for appending. Logging is best-effort: on failure the
+/// commands inherit tinycd's own stdout as before.
+async fn open_log(path: &Path) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("failed to open {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+/// Print a pipeline step and record it in the release log.
+fn banner(log: Option<&std::fs::File>, line: &str) {
+    println!("{line}");
+    if let Some(mut log) = log {
+        use std::io::Write;
+        let _ = writeln!(log, "{line}");
+    }
+}
+
+/// Send a command's output to the release log instead of tinycd's stdout.
+fn redirect(command: &mut Command, log: Option<&std::fs::File>) -> Result<(), Error> {
+    if let Some(log) = log {
+        command
+            .stdout(std::process::Stdio::from(log.try_clone()?))
+            .stderr(std::process::Stdio::from(log.try_clone()?));
+    }
+    Ok(())
 }
 
 /// A command line run through the given shell with the given environment.
@@ -873,6 +1418,7 @@ fn shell_command(
         .current_dir(dir)
         .env_remove("TINYCD_TOKEN")
         .env_remove("TINYCD_REPO")
+        .env_remove("TINYCD_REF")
         .envs(env);
     command
 }
@@ -886,8 +1432,13 @@ struct Server {
     job: std::os::windows::io::OwnedHandle,
 }
 
-fn start_server(spec: &RunSpec, release: &Path) -> Result<Server, Error> {
+fn start_server(
+    spec: &RunSpec,
+    release: &Path,
+    log: Option<&std::fs::File>,
+) -> Result<Server, Error> {
     let mut command = shell_command(&spec.shell, &spec.env, &spec.start, release);
+    redirect(&mut command, log)?;
     command.kill_on_drop(true);
     // A dedicated process group lets stop() signal every process the start
     // command spawns, not just the shell, and keeps the terminal's Ctrl+C
@@ -1032,31 +1583,75 @@ fn point_current(root: &Path, id: &str) -> std::io::Result<()> {
         })
 }
 
-/// Delete releases beyond the retention limit and staging folders left behind
-/// by interrupted deployments. Failures only log: the new release is live.
+/// Delete releases beyond the retention limit, plus folders left behind by
+/// interrupted deployments: anything dot-prefixed and anything still carrying
+/// an .incomplete-<id> marker. Failures only log: the new release is live.
 async fn prune(deployments: &Path, release: &Path, keep: usize) {
     let Ok(mut entries) = tokio::fs::read_dir(deployments).await else {
         return;
     };
-    let mut releases = Vec::new();
+    let mut incomplete = Vec::new();
+    let mut dirs = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path == release || !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+        if path == release {
             continue;
         }
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            remove(&path).await;
-        } else {
-            releases.push(path);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type().await.is_ok_and(|kind| kind.is_dir());
+        match (is_dir, name.starts_with('.')) {
+            (true, true) => remove(&path).await,
+            (true, false) => dirs.push(path),
+            (false, _) => {
+                if let Some(id) = name.strip_prefix(".incomplete-") {
+                    incomplete.push(id.to_owned());
+                    if let Err(error) = tokio::fs::remove_file(&path).await {
+                        eprintln!("failed to remove {}: {error}", path.display());
+                    }
+                }
+            }
         }
     }
 
+    let mut releases = Vec::new();
+    for dir in dirs {
+        let id = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if incomplete.contains(&id) {
+            remove(&dir).await;
+        } else {
+            releases.push(dir);
+        }
+    }
     releases.sort();
     for old in releases
         .iter()
         .take(releases.len().saturating_sub(keep - 1))
     {
         remove(old).await;
+    }
+}
+
+/// Keep only the newest `keep` release logs.
+async fn prune_logs(logs: &Path, keep: usize) {
+    let Ok(mut entries) = tokio::fs::read_dir(logs).await else {
+        return;
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "log") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    for old in files.iter().take(files.len().saturating_sub(keep)) {
+        if let Err(error) = tokio::fs::remove_file(old).await {
+            eprintln!("failed to remove {}: {error}", old.display());
+        }
     }
 }
 

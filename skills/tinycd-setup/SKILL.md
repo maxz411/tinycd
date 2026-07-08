@@ -70,17 +70,25 @@ combined with a URL argument.
 
 ## Verify a deployment
 
+Start with a dry run — it builds and starts one throwaway release, verifies
+it stays up (and passes `check` if configured), stops it, and exits without
+touching the deployed state:
+
 ```sh
-tinycd <url-or-path> --poll 5   # short poll while testing
+tinycd <url-or-path> --dry-run
 ```
 
-Watch for `running sync/install/start` lines and a final
-`deployed <root>/deployments/<id>`. Then check:
+Then run for real and inspect with `tinycd --status` (release id, commit,
+log path, whether the daemon is running). Every release's sync/install/start
+output is captured in `<root>/logs/<id>.log`; deployment failure messages
+cite the log. Push a trivial commit and confirm a second release appears and
+`current` moves.
 
-- `<root>/current` points at the newest release folder.
-- The app answers (curl its port, check its log file, etc.).
-- Push a trivial commit and confirm a second release appears and `current`
-  moves.
+New releases are health-gated: a started server must stay up three seconds,
+and pass the `check` command when one is configured, before `current`
+advances — otherwise the release is torn down, the previous one is
+restarted, and the failure is logged. Configure
+`check = "curl -sf localhost:PORT/health"` for real readiness gating.
 
 ## Webhooks
 
@@ -96,6 +104,9 @@ curl -X POST -H "Authorization: Bearer $TINYCD_TOKEN" \
 
 - Hook mode requires the token; prefer the environment variable over the
   config file or the CLI flag.
+- Forge-native webhooks work directly: set the token as the GitLab webhook
+  secret (`X-Gitlab-Token`) or the GitHub webhook secret
+  (`X-Hub-Signature-256` HMAC of the body). No proxy shim is needed.
 - A webhook POST always deploys, even if the remote is unchanged — it doubles
   as a redeploy button.
 - With both `hook` and `poll` set, polling skips commits a webhook already
@@ -138,10 +149,11 @@ records the last deployed commit).
   after a 10-second grace period. On Windows a job object guarantees nothing
   outlives tinycd.
 - **Roll back**: the reliable path is `git revert` + push — tinycd deploys the
-  revert like any commit. For a manual rollback: stop tinycd, repoint
-  `<root>/current` at an older folder under `<root>/deployments/`, start
-  tinycd; it resumes whatever `current` points at and will not redeploy until
-  the remote actually changes.
+  revert like any commit. For an immediate local rollback: stop tinycd, run
+  `tinycd --rollback` (previous release) or `tinycd --rollback <id>` (a
+  specific retained release), then start tinycd again; it resumes whatever
+  `current` points at and will not redeploy until the remote actually
+  changes.
 
 ## Multiple projects
 
@@ -160,3 +172,6 @@ instance pointed at the same root exits immediately instead of interfering.
 | `…contains a token and must not be readable by group or other users` | `chmod 600 .tinycd/config.toml`, or move the token to `TINYCD_TOKEN`. |
 | `failed to listen on <address>` | Another process (often another tinycd) owns that hook port; pick a unique address per instance. |
 | `hook mode requires --token, …` | Webhooks never run unauthenticated; generate a token first. |
+| `deployment failed: the server exited with … within 3 seconds` | The start command crashed on launch; the previous release was restarted and `current` never moved. Read the cited log, fix, and push. |
+| `deployment failed: the check command did not pass within 30 seconds` | The release started but never became healthy; same recovery as above. |
+| Vendored/untracked files missing in releases | Fresh clones only contain committed files. List stateful paths in `share = [...]` and put the real files under `<root>/shared/`. |

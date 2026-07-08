@@ -5,9 +5,16 @@
 # Git URL or an existing remote name. Defaults to origin.
 repo = "git@github.com:example/app.git"
 
+# Branch or tag to deploy. Defaults to the remote HEAD.
+# ref = "production"
+
 # Enable polling, webhooks, or both. Polling defaults to 30 when neither is set.
 poll = 30
 # hook = "127.0.0.1:8080"
+
+# Untracked paths every release shares, linked from <root>/shared after sync.
+# A trailing slash creates a missing entry as a directory.
+# share = ["data/", ".env"]
 
 # Where deployments live; relative paths resolve against this file's
 # directory, so "." keeps them inside .tinycd/. Defaults to <dir>/.tinycd for
@@ -22,6 +29,10 @@ interlock = "interlock"
 sync = 'git clone --depth 1 "$TINYCD_REPO" .'
 install = "npm ci"
 start = "npm start"
+
+# Optional deployment gate: a new release must stay up three seconds and pass
+# this command (retried up to 30s) before it replaces the previous release.
+# check = "curl -sf localhost:3000/health"
 
 # Retain enough releases for quick rollback without filling a home computer.
 keep = 5

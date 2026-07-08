@@ -83,8 +83,18 @@ keep = 5
 to `<dir>/.tinycd` when tinycd is given a Git URL, and to
 `~/.tinycd/<name>-<hash>` when it tracks a checkout, so `.tinycd/` is
 tinycd's one footprint either way. `repo` defaults to the tracked checkout's
-`origin`. `hook` and `install` are disabled by default. `start` has no
+`origin`, and `ref` — a branch or tag to deploy instead of the remote HEAD —
+is unset, as are `hook`, `install`, `share`, and `check`. `start` has no
 default because guessing how to launch an arbitrary project would be unsafe.
+
+Useful one-off invocations:
+
+```sh
+tinycd --dry-run        # build and start one throwaway release, then stop it
+tinycd --status         # deployed release, commit, log path, daemon state
+tinycd --rollback       # repoint current at the previous release (daemon stopped)
+tinycd --rollback <id>  # or at a specific retained release
+```
 
 ## Configuration
 
@@ -100,14 +110,17 @@ All runtime settings can be placed in the local `.tinycd/config.toml`:
 
 ```toml
 repo = "git@github.com:example/app.git"
+ref = "production"
 poll = 30
 hook = "127.0.0.1:8080"
 root = "."
 interlock = "interlock"
+share = ["data/", ".env"]
 shell = ["sh", "-c"]
-sync = 'git clone --depth 1 "$TINYCD_REPO" .'
+sync = 'git clone --depth 1 --branch "$TINYCD_REF" "$TINYCD_REPO" .'
 install = "npm ci"
 start = "npm start"
+check = "curl -sf localhost:3000/health"
 keep = 5
 
 [env] # keep this table last: keys below a table header belong to it
@@ -122,7 +135,23 @@ resolved relative to the file's directory — `.tinycd/` — so `root = "."`
 keeps releases inside `.tinycd/` itself.
 
 The default files are optional. Passing `--config <path>` makes that specific
-file required. Unknown settings and invalid values are rejected.
+file required. Unknown settings and invalid values are rejected, including a
+tinycd setting accidentally placed under `[env]` — everything below a TOML
+table header belongs to that table, which is also why `[env]` goes last (or
+use dotted keys like `env.PYTHONPATH = "..."` anywhere in the file).
+
+`share` names paths that stay out of Git but must survive from release to
+release — vendored libraries, `.env` files, SQLite databases, upload dirs.
+Each entry is linked into the release from `<root>/shared/` after sync, so
+every release sees the same files. A trailing slash marks an entry that
+should be created as a directory when `<root>/shared/` does not have it yet.
+
+`check` gates deployments: a started release must stay up for three seconds,
+and pass the check command (retried for up to 30 seconds) when one is set,
+before `current` moves. A release that fails is torn down and the previous
+release is restarted, so a bad push degrades to a logged failure instead of
+an outage. `tinycd --dry-run` runs the same pipeline and verification against
+a throwaway folder and exits, without touching the deployed state.
 
 The sync, install, and start commands run through `shell` and inherit tinycd's
 environment plus the `[env]` table. tinycd does not manage language runtimes
@@ -144,9 +173,9 @@ enables both modes; polling skips commits a webhook already deployed. A
 webhook always deploys, even when the remote has not changed, so it doubles
 as a redeploy button.
 
-Webhook mode requires a bearer token containing at least 32 printable non-space
-ASCII bytes. Prefer the environment so the token is not stored in the config or
-placed in process arguments:
+Webhook mode requires a token containing at least 32 printable non-space
+ASCII bytes. Prefer the environment so the token is not stored in the config
+or placed in process arguments:
 
 ```sh
 export TINYCD_TOKEN="$(openssl rand -hex 32)"
@@ -156,6 +185,11 @@ curl -X POST \
   -H "Authorization: Bearer $TINYCD_TOKEN" \
   http://localhost:8080/deploy
 ```
+
+The forges' native webhooks are accepted directly — no proxy shim needed.
+Use the token as the GitLab webhook's secret token (sent as
+`X-Gitlab-Token`) or as the GitHub webhook's secret (verified as the
+`X-Hub-Signature-256` HMAC of the request body).
 
 A token may be placed in `.tinycd/config.toml`, but on Unix the file must not be
 readable by group or other users. Use HTTPS through a reverse proxy whenever
@@ -171,22 +205,33 @@ The root — printed at startup — is laid out as:
 ├── current -> deployments/1751392800000
 ├── head
 ├── lock
+├── logs/
+│   └── 1751392800000.log
+├── shared/            # only with share entries
 └── deployments/
     ├── 1751392700000/
     └── 1751392800000/
 ```
+
+Sync, install, check, and start output is captured per release in `logs/`,
+retained like releases, so a failed deployment can be examined after the
+fact; failure messages cite the log path.
 
 Run one tinycd per project; any number can run side by side because every
 project has its own root, and tinycd holds an exclusive lock on `<root>/lock`
 so a second instance pointed at the same root refuses to start. Instances
 that listen for webhooks each need their own `hook` address.
 
-The sync command starts in a new empty deployment folder. `TINYCD_REPO` is
-available only to that command. Install and start run in the populated folder.
-Failed syncs and installs are removed, and folders left behind by interrupted
-deployments are cleaned up on the next deployment. Successful releases beyond
-`keep` are deleted oldest-first after the new release starts. `head` records
-the deployed commit so restarts pick up where the last run stopped.
+The sync command starts in a new empty deployment folder. `TINYCD_REPO` (and
+`TINYCD_REF` when `ref` is set) is available only to that command. Install
+and start run in the populated folder. The folder carries its final name from
+the beginning — nothing is renamed after install, so absolute paths that
+package managers bake into virtualenvs and shebangs stay valid — and a marker
+file distinguishes completed releases from interrupted ones, which are
+cleaned up on the next deployment along with failed syncs and installs.
+Successful releases beyond `keep` are deleted oldest-first after the new
+release starts. `head` records the deployed commit so restarts pick up where
+the last run stopped.
 
 The start command runs in its own process group. When a new release is ready,
 or when tinycd itself receives Ctrl+C, SIGTERM, or SIGHUP (the terminal that

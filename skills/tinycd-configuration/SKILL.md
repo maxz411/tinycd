@@ -30,7 +30,9 @@ Rules that apply everywhere:
 - Relative paths in a file resolve against the file's directory; relative CLI
   paths resolve against the working directory.
 - In TOML, keys written below a table header belong to that table — keep
-  `[env]` last in the file.
+  `[env]` last in the file, or use dotted keys (`env.PYTHONPATH = "..."`)
+  anywhere. A tinycd setting name appearing inside `[env]` is rejected with a
+  hint, since it is almost always a misplaced key.
 - `--env KEY=VALUE` entries override matching `[env]` keys; local `[env]`
   keys override the repository's.
 
@@ -45,6 +47,21 @@ are used verbatim. Polling runs `git ls-remote <repo> HEAD`, so whatever git
 authentication works for that URL in the service's environment (ssh agent,
 credential helper) works here.
 
+### ref — branch or tag to deploy
+String, default: the remote HEAD. Feeds both polling (`git ls-remote <repo>
+<ref>`) and the default sync (`--branch "$TINYCD_REF"`), so pushes to other
+branches never trigger a deploy and the clone always matches what was
+polled. A name that is both a branch and a tag resolves to the branch.
+
+### share — paths every release shares
+Array of relative paths, empty by default. After sync, each entry is linked
+into the release from `<root>/shared/<entry>` (symlinks on Unix; junctions
+for directories and hard links for files on Windows), replacing whatever the
+clone produced there. Use it for anything untracked or stateful: vendored
+libraries, `.env`, SQLite files, upload dirs. Missing sources are created —
+entries with a trailing slash as directories, others as empty files. Put the
+real content under `<root>/shared/` once and every release sees it.
+
 ### poll — polling interval, seconds
 Integer ≥ 1. Default: 30 when neither `poll` nor `hook` is set; unset (no
 polling) when only `hook` is set. Each tick compares the remote HEAD with the
@@ -58,12 +75,15 @@ even when the remote is unchanged (useful as a redeploy button). May be
 combined with `poll`; polling then skips commits the webhook already
 deployed. Requires `token`.
 
-### token — webhook bearer token
+### token — webhook secret
 At least 32 printable non-space ASCII characters. Prefer `TINYCD_TOKEN` in
 the environment: a token in `.tinycd/config.toml` requires the file to be unreadable
 by group/other on Unix (`chmod 600`), and `--token` puts it in the process
 list. Only the local file's token is used; a `token` in the repository's copy
-is ignored. tinycd stores and compares only a SHA-256 of it.
+is ignored. Three delivery schemes are accepted: `Authorization: Bearer`,
+GitLab's `X-Gitlab-Token` (set the token as the webhook's secret token), and
+GitHub's `X-Hub-Signature-256` (set the token as the webhook secret; the
+HMAC of the body is verified). All comparisons are constant-time.
 
 ### root — deployment state directory
 Path. Default: `<dir>/.tinycd` when tinycd was given a Git URL;
@@ -108,6 +128,15 @@ three. When a new release is ready (or tinycd stops), the group gets SIGTERM
 (Ctrl+Break on Windows), then SIGKILL after 10 seconds. Long-running
 foreground commands only; if the command daemonizes itself, tinycd cannot
 manage it.
+
+### check — health gate (optional)
+Command string, disabled by default; may come from the repository's file.
+Every started release must stay up for three seconds; with `check` set it
+must also make this command exit 0 (run in the release folder, retried every
+second for up to 30 seconds) before `current` advances. On failure the new
+release is torn down and the previous release is restarted, so a bad push
+never replaces a working deployment. `tinycd --dry-run` applies the same
+verification to a throwaway release.
 
 ### keep — retained releases
 Integer ≥ 1, default 5. After a successful start, older releases beyond the
