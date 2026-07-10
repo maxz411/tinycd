@@ -1,4 +1,5 @@
 mod setup;
+mod tui;
 
 use std::{
     collections::BTreeMap,
@@ -26,6 +27,35 @@ use tokio::{
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Where daemon output goes: the dashboard when one is showing, stdout and
+/// stderr otherwise. Set once at startup.
+static UI: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>> =
+    std::sync::OnceLock::new();
+
+fn say(line: impl Into<String>) {
+    let line = line.into();
+    match UI.get() {
+        Some(tx) => {
+            if let Err(returned) = tx.send(line) {
+                println!("{}", returned.0);
+            }
+        }
+        None => println!("{line}"),
+    }
+}
+
+fn say_err(line: impl Into<String>) {
+    let line = line.into();
+    match UI.get() {
+        Some(tx) => {
+            if let Err(returned) = tx.send(line) {
+                eprintln!("{}", returned.0);
+            }
+        }
+        None => eprintln!("{line}"),
+    }
+}
 
 /// How long a stopping release gets to exit gracefully before it is killed.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
@@ -151,6 +181,11 @@ struct Cli {
         default_missing_value = ""
     )]
     rollback: Option<String>,
+
+    /// Plain line output instead of the live dashboard on interactive
+    /// terminals.
+    #[arg(long)]
+    no_tui: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -652,6 +687,7 @@ async fn run() -> Result<(), Error> {
     let show_status = cli.status;
     let rollback_to = cli.rollback.clone();
     let dry = cli.dry_run;
+    let use_tui = !cli.no_tui && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let config = Config::load(cli, mode).await?;
     if show_status {
         return status(&config).await;
@@ -668,12 +704,17 @@ async fn run() -> Result<(), Error> {
         running: Arc::default(),
     };
     let _lock = lock_root(&app.config.root)?;
-    println!("tracking {}", app.config.repo);
-    println!("deployments in {}", app.config.root.display());
 
-    resume(&app).await?;
+    let dashboard_lines = use_tui.then(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = UI.set(tx);
+        rx
+    });
+    say(format!("tracking {}", app.config.repo));
+    say(format!("deployments in {}", app.config.root.display()));
 
-    let run = async {
+    let daemon = async {
+        resume(&app).await?;
         match (app.config.poll, app.config.hook) {
             (Some(seconds), None) => poll(app.clone(), seconds).await,
             (None, Some(address)) => serve(app.clone(), address).await,
@@ -684,15 +725,37 @@ async fn run() -> Result<(), Error> {
             (None, None) => unreachable!("Config::load defaults to polling"),
         }
     };
+    let dashboard = async {
+        match dashboard_lines {
+            Some(lines) => tui::dashboard(&app, lines).await,
+            None => std::future::pending().await,
+        }
+    };
 
     tokio::select! {
-        result = run => result,
+        result = daemon => {
+            if use_tui {
+                ratatui::restore();
+            }
+            result
+        }
         _ = shutdown_signal() => {
-            println!("shutting down");
+            if use_tui {
+                ratatui::restore();
+            }
+            say("shutting down");
             if let Some(server) = app.running.lock().await.server.take() {
                 server.stop().await?;
             }
             Ok(())
+        }
+        // The dashboard returns when the user quits; treat it like Ctrl+C.
+        result = dashboard => {
+            say("shutting down");
+            if let Some(server) = app.running.lock().await.server.take() {
+                server.stop().await?;
+            }
+            result
         }
     }
 }
@@ -785,13 +848,13 @@ async fn poll(app: App, seconds: u64) -> Result<(), Error> {
                 };
                 if outdated {
                     if let Err(error) = deploy(&app).await {
-                        eprintln!("deployment failed: {error}");
+                        say_err(format!("deployment failed: {error}"));
                     }
                 } else if head.is_none() {
                     app.running.lock().await.head = Some(next);
                 }
             }
-            Err(error) => eprintln!("failed to poll {}: {error}", app.config.repo),
+            Err(error) => say_err(format!("failed to poll {}: {error}", app.config.repo)),
         }
 
         tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -852,7 +915,7 @@ async fn serve(app: App, address: SocketAddr) -> Result<(), Error> {
         .await
         .map_err(|error| format!("failed to listen on {address}: {error}"))?;
 
-    println!("listening for POST /deploy on {address}");
+    say(format!("listening for POST /deploy on {address}"));
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -996,13 +1059,13 @@ async fn deploy(app: &App) -> Result<(), Error> {
         return Err(format!("failed to update the current deployment: {error}").into());
     }
     if let Err(error) = tokio::fs::write(config.root.join("head"), format!("{head}\n")).await {
-        eprintln!("failed to record the deployed commit: {error}");
+        say_err(format!("failed to record the deployed commit: {error}"));
     }
     running.head = Some(head);
 
     prune(&deployments, &release, config.keep).await;
     prune_logs(&config.root.join("logs"), config.keep).await;
-    println!("deployed {}", release.display());
+    say(format!("deployed {}", release.display()));
     Ok(())
 }
 
@@ -1224,10 +1287,10 @@ async fn restart_previous(config: &Config, running: &mut Running) {
             banner(log.as_ref(), "restarting the previous release");
             match start_server(&spec, &current, log.as_ref()) {
                 Ok(server) => running.server = Some(server),
-                Err(error) => eprintln!("failed to restart the previous release: {error}"),
+                Err(error) => say_err(format!("failed to restart the previous release: {error}")),
             }
         }
-        Err(error) => eprintln!("failed to restart the previous release: {error}"),
+        Err(error) => say_err(format!("failed to restart the previous release: {error}")),
     }
 }
 
@@ -1377,7 +1440,7 @@ async fn open_log(path: &Path) -> Option<std::fs::File> {
     {
         Ok(file) => Some(file),
         Err(error) => {
-            eprintln!("failed to open {}: {error}", path.display());
+            say_err(format!("failed to open {}: {error}", path.display()));
             None
         }
     }
@@ -1385,7 +1448,7 @@ async fn open_log(path: &Path) -> Option<std::fs::File> {
 
 /// Print a pipeline step and record it in the release log.
 fn banner(log: Option<&std::fs::File>, line: &str) {
-    println!("{line}");
+    say(line);
     if let Some(mut log) = log {
         use std::io::Write;
         let _ = writeln!(log, "{line}");
@@ -1606,7 +1669,7 @@ async fn prune(deployments: &Path, release: &Path, keep: usize) {
                 if let Some(id) = name.strip_prefix(".incomplete-") {
                     incomplete.push(id.to_owned());
                     if let Err(error) = tokio::fs::remove_file(&path).await {
-                        eprintln!("failed to remove {}: {error}", path.display());
+                        say_err(format!("failed to remove {}: {error}", path.display()));
                     }
                 }
             }
@@ -1650,14 +1713,14 @@ async fn prune_logs(logs: &Path, keep: usize) {
     files.sort();
     for old in files.iter().take(files.len().saturating_sub(keep)) {
         if let Err(error) = tokio::fs::remove_file(old).await {
-            eprintln!("failed to remove {}: {error}", old.display());
+            say_err(format!("failed to remove {}: {error}", old.display()));
         }
     }
 }
 
 async fn remove(path: &Path) {
     if let Err(error) = tokio::fs::remove_dir_all(path).await {
-        eprintln!("failed to remove {}: {error}", path.display());
+        say_err(format!("failed to remove {}: {error}", path.display()));
     }
 }
 
@@ -1668,14 +1731,17 @@ async fn wait_for_interlock(path: &Path) -> Result<(), Error> {
         match tokio::fs::symlink_metadata(path).await {
             Ok(_) => {
                 if !waiting {
-                    println!("waiting for interlock to disappear: {}", path.display());
+                    say(format!(
+                        "waiting for interlock to disappear: {}",
+                        path.display()
+                    ));
                     waiting = true;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if waiting {
-                    println!("interlock removed: {}", path.display());
+                    say(format!("interlock removed: {}", path.display()));
                 }
                 return Ok(());
             }

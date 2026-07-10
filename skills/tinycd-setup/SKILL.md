@@ -61,8 +61,11 @@ tinycd ~/code/app # or point at it
   should live, and writes the config before starting. Non-interactive runs
   (systemd, CI) skip the wizard and fail with a clear error instead.
 
-A first run deploys immediately. The startup output prints which repository
-is tracked and where the root is.
+A first run deploys immediately. On an interactive terminal the running
+daemon shows a live ratatui dashboard (releases, current marker, activity
+feed; `q` quits gracefully); `--no-tui` gives plain line output instead, and
+non-interactive runs are always plain. The startup output prints which
+repository is tracked and where the root is.
 
 Anything that looks like `scheme://…` or scp-style `host:path` is treated as
 a URL; anything else must be an existing directory. `--repo` cannot be

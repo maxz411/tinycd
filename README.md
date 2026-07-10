@@ -87,6 +87,11 @@ tinycd's one footprint either way. `repo` defaults to the tracked checkout's
 is unset, as are `hook`, `install`, `share`, and `check`. `start` has no
 default because guessing how to launch an arbitrary project would be unsafe.
 
+On an interactive terminal the daemon shows a live dashboard — tracked
+repository, retained releases with the current one marked, and the activity
+feed — and quits gracefully on `q`. Pass `--no-tui` for plain line output;
+non-interactive runs (systemd, pipes, CI) are always plain.
+
 Useful one-off invocations:
 
 ```sh
