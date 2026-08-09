@@ -12,8 +12,8 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Paragraph, Wrap},
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -21,6 +21,11 @@ use crate::{App, Error, format_age};
 
 /// How many activity lines are retained for display.
 const SCROLLBACK: usize = 300;
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Redraws per snapshot refresh; the redraw tick drives the animations.
+const TICKS_PER_SNAPSHOT: u64 = 5;
 
 /// Run the dashboard until the user quits with q or Ctrl+C. The terminal is
 /// restored before returning; a return means "shut the daemon down".
@@ -38,20 +43,29 @@ pub async fn dashboard(app: &App, mut lines: UnboundedReceiver<String>) -> Resul
     });
 
     let mut terminal = ratatui::init();
+    let truecolor = truecolor();
     let mut activity: VecDeque<String> = VecDeque::new();
     let mut snapshot = Snapshot::read(app).await;
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut frame_count: u64 = 0;
 
     let result = loop {
         while let Ok(line) = lines.try_recv() {
             push(&mut activity, line);
         }
-        if let Err(error) = terminal.draw(|frame| draw(frame, app, &snapshot, &activity)) {
+        if let Err(error) =
+            terminal.draw(|frame| draw(frame, app, &snapshot, &activity, frame_count, truecolor))
+        {
             break Err(error.into());
         }
 
         tokio::select! {
-            _ = tick.tick() => snapshot = Snapshot::read(app).await,
+            _ = tick.tick() => {
+                frame_count += 1;
+                if frame_count.is_multiple_of(TICKS_PER_SNAPSHOT) {
+                    snapshot = Snapshot::read(app).await;
+                }
+            }
             Some(line) = lines.recv() => push(&mut activity, line),
             Some(event) = keys.recv() => {
                 if let Event::Key(key) = event
@@ -135,39 +149,172 @@ impl Snapshot {
     }
 }
 
-fn draw(frame: &mut Frame, app: &App, snapshot: &Snapshot, activity: &VecDeque<String>) {
-    let releases_height = (snapshot.releases.len().clamp(1, 6) + 2) as u16;
-    let [header_area, releases_area, activity_area] = Layout::vertical([
-        Constraint::Length(4),
+/// Whether the terminal advertises 24-bit color. Terminals that support it
+/// set COLORTERM=truecolor (or 24bit), or use a -direct TERM entry; anything
+/// else gets the 16-color palette so the RGB animations degrade gracefully.
+fn truecolor() -> bool {
+    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+    colorterm.contains("truecolor")
+        || colorterm.contains("24bit")
+        || std::env::var("TERM").is_ok_and(|term| term.contains("direct"))
+}
+
+/// A slow triangle wave in 0..=1 used to pulse colors.
+fn pulse(frame: u64, period: u64) -> f32 {
+    let phase = (frame % period) as f32 / period as f32;
+    1.0 - (2.0 * phase - 1.0).abs()
+}
+
+/// Pulse a color between a dim floor and full brightness. Without truecolor,
+/// blink between the normal and bright variants of the base color instead.
+fn glow(rgb: (u8, u8, u8), base: Color, bright: Color, level: f32, truecolor: bool) -> Color {
+    let level = level.clamp(0.0, 1.0);
+    if !truecolor {
+        return if level > 0.5 { bright } else { base };
+    }
+    let (r, g, b) = rgb;
+    let scale = 0.55 + 0.45 * level;
+    Color::Rgb(
+        (r as f32 * scale) as u8,
+        (g as f32 * scale) as u8,
+        (b as f32 * scale) as u8,
+    )
+}
+
+/// A cyan-to-violet gradient that drifts across the title over time. Without
+/// truecolor, a coarser wave of the nearest palette colors drifts instead.
+fn shimmer(index: usize, frame: u64, truecolor: bool) -> Color {
+    let t = index as f32 * 0.45 - frame as f32 * 0.12;
+    let x = (t.sin() + 1.0) / 2.0;
+    if !truecolor {
+        return match (x * 4.0) as u8 {
+            0 => Color::Cyan,
+            1 => Color::LightCyan,
+            2 => Color::LightBlue,
+            _ => Color::LightMagenta,
+        };
+    }
+    Color::Rgb((110.0 + x * 120.0) as u8, (220.0 - x * 130.0) as u8, 255)
+}
+
+/// A full-width `── title ────` divider replacing the old box borders.
+fn rule(title: &str, width: u16, accent: Color) -> Line<'static> {
+    let dash = Style::default().fg(Color::DarkGray);
+    let fill = "─".repeat((width as usize).saturating_sub(title.chars().count() + 6));
+    Line::from(vec![
+        Span::styled(" ── ", dash),
+        Span::styled(
+            title.to_owned(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", dash),
+        Span::styled(fill, dash),
+    ])
+}
+
+fn draw(
+    frame: &mut Frame,
+    app: &App,
+    snapshot: &Snapshot,
+    activity: &VecDeque<String>,
+    tick: u64,
+    truecolor: bool,
+) {
+    let width = frame.area().width;
+    let releases_height = snapshot.releases.len().clamp(1, 6) as u16;
+    let [
+        header_area,
+        releases_rule_area,
+        releases_area,
+        activity_rule_area,
+        activity_area,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Length(releases_height),
-        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
     ])
     .areas(frame.area());
 
     let config = &app.config;
-    let mut tracking = config.repo.clone();
-    if let Some(git_ref) = &config.git_ref {
-        tracking.push_str(&format!(" @ {git_ref}"));
+    let spinner = SPINNER[(tick as usize) % SPINNER.len()];
+    let mut title = vec![Span::styled(
+        format!(" {spinner} "),
+        Style::default().fg(Color::Magenta),
+    )];
+    for (index, letter) in "tinycd".chars().enumerate() {
+        title.push(Span::styled(
+            letter.to_string(),
+            Style::default()
+                .fg(shimmer(index, tick, truecolor))
+                .add_modifier(Modifier::BOLD),
+        ));
     }
-    let mut state = Vec::new();
+    title.push(Span::styled(
+        format!("  {}", config.repo),
+        Style::default().fg(Color::White),
+    ));
+    if let Some(git_ref) = &config.git_ref {
+        title.push(Span::styled(" @ ", Style::default().fg(Color::DarkGray)));
+        title.push(Span::styled(
+            git_ref.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    let dot_sep = Span::styled("  ·  ", Style::default().fg(Color::DarkGray));
+    let mut state = vec![Span::raw("   ")];
+    if snapshot.server_up {
+        state.push(Span::styled(
+            "●",
+            Style::default().fg(glow(
+                (80, 220, 130),
+                Color::Green,
+                Color::LightGreen,
+                pulse(tick, 20),
+                truecolor,
+            )),
+        ));
+        state.push(Span::styled(
+            " server up",
+            Style::default().fg(Color::Green),
+        ));
+    } else {
+        state.push(Span::styled("●", Style::default().fg(Color::Red)));
+        state.push(Span::styled(
+            " server down",
+            Style::default().fg(Color::Red),
+        ));
+    }
     if let Some(seconds) = config.poll {
-        state.push(format!("polling every {seconds}s"));
+        state.push(dot_sep.clone());
+        state.push(Span::styled(
+            format!("polling every {seconds}s"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if let Some(address) = config.hook {
-        state.push(format!("hook on {address}"));
+        state.push(dot_sep.clone());
+        state.push(Span::styled(
+            format!("hook on {address}"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
-    state.push(if snapshot.server_up {
-        "server up".to_owned()
-    } else {
-        "server down".to_owned()
-    });
-    let header = Paragraph::new(vec![
-        Line::from(tracking),
-        Line::from(format!("root {}", config.root.display())),
-        Line::styled(state.join(" · "), Style::default().fg(Color::Cyan)),
-    ])
-    .block(Block::bordered().title(" tinycd "));
+    state.push(dot_sep);
+    state.push(Span::styled(
+        format!("root {}", config.root.display()),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let header = Paragraph::new(vec![Line::default(), Line::from(title), Line::from(state)]);
     frame.render_widget(header, header_area);
+    frame.render_widget(
+        Paragraph::new(rule("releases", width, Color::Magenta)),
+        releases_rule_area,
+    );
 
     let mut rows = Vec::new();
     for (id, building) in snapshot.releases.iter().take(6) {
@@ -182,48 +329,105 @@ fn draw(frame: &mut Frame, app: &App, snapshot: &Snapshot, activity: &VecDeque<S
             .map(|age| format!("{} ago", format_age(age)))
             .unwrap_or_default();
         let is_current = snapshot.current.as_deref() == Some(id.as_str());
-        let marker = if is_current { "●" } else { " " };
-        let mut label = format!(" {marker} {id}  {age}");
+        let mut row = Vec::new();
         if is_current {
-            label.push_str("  current");
+            row.push(Span::styled(
+                " ● ",
+                Style::default().fg(glow(
+                    (90, 200, 255),
+                    Color::Cyan,
+                    Color::LightCyan,
+                    pulse(tick, 24),
+                    truecolor,
+                )),
+            ));
+            row.push(Span::styled(
+                id.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            row.push(Span::styled(
+                format!("  {age}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            row.push(Span::styled("  current", Style::default().fg(Color::Green)));
             if let Some(head) = &snapshot.head {
-                label.push_str(&format!("  {}", &head[..head.len().min(12)]));
+                row.push(Span::styled(
+                    format!("  {}", &head[..head.len().min(12)]),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
+        } else {
+            row.push(Span::raw("   "));
+            row.push(Span::styled(id.clone(), Style::default().fg(Color::Gray)));
+            row.push(Span::styled(
+                format!("  {age}"),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         if *building {
-            label.push_str("  building");
+            row.push(Span::styled(
+                format!("  {spinner} building"),
+                Style::default().fg(Color::Yellow),
+            ));
         }
-        let style = if is_current {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        rows.push(Line::styled(label, style));
+        rows.push(Line::from(row));
     }
     if rows.is_empty() {
-        rows.push(Line::from(" none yet"));
+        rows.push(Line::styled(
+            "   none yet",
+            Style::default().fg(Color::DarkGray),
+        ));
     }
-    let releases = Paragraph::new(rows).block(Block::bordered().title(" releases "));
-    frame.render_widget(releases, releases_area);
+    frame.render_widget(Paragraph::new(rows), releases_area);
 
-    let visible = activity_area.height.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(rule("activity", width, Color::Magenta)),
+        activity_rule_area,
+    );
+    let visible = activity_area.height as usize;
+    let shown = activity.len().min(visible);
     let tail = activity
         .iter()
-        .skip(activity.len().saturating_sub(visible))
-        .map(|line| {
-            if line.contains("failed") || line.starts_with("error") {
-                Line::styled(line.clone(), Style::default().fg(Color::Red))
+        .skip(activity.len() - shown)
+        .enumerate()
+        .map(|(index, line)| {
+            let mut style = if line.contains("failed") || line.starts_with("error") {
+                Style::default().fg(Color::Red)
+            } else if line.starts_with("deployed") {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.starts_with("running ") {
+                Style::default().fg(Color::Yellow)
+            } else if line.starts_with("tracking")
+                || line.starts_with("listening")
+                || line.starts_with("deployments in")
+            {
+                Style::default().fg(Color::Cyan)
+            } else if line.starts_with("shutting down") {
+                Style::default().fg(Color::Magenta)
             } else {
-                Line::from(line.clone())
+                Style::default().fg(Color::Gray)
+            };
+            // Older lines fade so the newest activity draws the eye.
+            if index + 1 < shown {
+                style = style.add_modifier(Modifier::DIM);
             }
+            Line::styled(format!(" {line}"), style)
         })
         .collect::<Vec<_>>();
-    let feed = Paragraph::new(tail).wrap(Wrap { trim: false }).block(
-        Block::bordered()
-            .title(" activity ")
-            .title_bottom(Line::from(" q quit ").centered()),
+    frame.render_widget(
+        Paragraph::new(tail).wrap(Wrap { trim: false }),
+        activity_area,
     );
-    frame.render_widget(feed, activity_area);
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            " q quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+        footer_area,
+    );
 }
