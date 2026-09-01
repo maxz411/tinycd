@@ -1,0 +1,5 @@
+reviews:
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        make sure that the feature was implemented with as little code as possible. This means that if an architectural refactor should be done instead that would make this feature feel better integrated and not patched on, that is the better direction. At each point in this codebase, all features should fit together cohesively
