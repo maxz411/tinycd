@@ -101,6 +101,7 @@ impl Server {
             .map(|status| format!("the server exited with {status}")))
     }
 
+    #[allow(unused_mut)]
     pub fn detach(mut self) -> Result<(), Error> {
         #[cfg(windows)]
         {

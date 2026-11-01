@@ -10,7 +10,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM alpine:3.20
+FROM alpine:3.22
 RUN apk add --no-cache git docker-cli ca-certificates curl tini
 COPY --from=build /src/target/release/tinycd /usr/local/bin/tinycd
 ENV TINYCD_HOME=/data

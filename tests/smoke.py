@@ -145,7 +145,8 @@ class Smoke:
                   'port': self.app_port,
                   'check': f'curl -fsS http://127.0.0.1:{self.app_port}/version'}
         if runtime == 'oci':
-            recipe.update(start='exec httpd -f -p "$PORT" -h /app', base='alpine:3.22')
+            recipe.update(start='exec httpd -f -p "$PORT" -h /app', base='alpine:3.22',
+                          install='apk add --no-cache busybox-extras')
         config = self.repo / '.tinycd' / 'config.toml'
         config.parent.mkdir(exist_ok=True)
         config.write_text('\n'.join(f'{key} = {json.dumps(value)}' for key, value in recipe.items()))
