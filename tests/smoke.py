@@ -79,6 +79,10 @@ class Smoke:
         self.token = None
         self.repo = root / 'My_App.v1'
         self.repo.mkdir()
+        # HTTPServer resolves getfqdn() before listen(), which can stall for
+        # ~35 seconds on macOS runners: actions/runner-images#14409.
+        fixture = Path(__file__).parent / 'fixtures' / 'server.py'
+        (self.repo / 'serve.py').write_text(fixture.read_text())
         self.git('init', '-b', 'main')
         self.git('config', 'user.email', 'smoke@example.invalid')
         self.git('config', 'user.name', 'tinycd smoke')
@@ -143,7 +147,7 @@ class Smoke:
         return urllib.request.urlopen(f'http://127.0.0.1:{self.app_port}/version', timeout=2).read().decode()
 
     def lifecycle(self, host, runtime, name):
-        recipe = {'start': 'exec python3 -m http.server "$PORT" --bind 127.0.0.1',
+        recipe = {'start': 'exec python3 serve.py',
                   'port': self.app_port,
                   'check': f'curl -fsS http://127.0.0.1:{self.app_port}/version'}
         if runtime == 'oci':
