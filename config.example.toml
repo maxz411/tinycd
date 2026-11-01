@@ -1,6 +1,11 @@
 # tinycd configuration; lives at .tinycd/config.toml in the tracked
-# directory. In a copy committed to the deployed repository, only shell, env,
-# install, and start are used; the rest come from the machine running tinycd.
+# directory. In a copy committed to the deployed repository, only the recipe
+# is used — shell, env, install, start, check, port, base, dockerfile — and
+# the rest comes from the machine running tinycd (this file, or the
+# project's settings in the dashboard).
+
+# Shown in the dashboard. Defaults to the directory name.
+# name = "example"
 
 # Git URL or an existing remote name. Defaults to origin.
 repo = "git@github.com:example/app.git"
@@ -8,17 +13,28 @@ repo = "git@github.com:example/app.git"
 # Branch or tag to deploy. Defaults to the remote HEAD.
 # ref = "production"
 
-# Enable polling, webhooks, or both. Polling defaults to 30 when neither is set.
+# Poll the remote every N seconds. Defaults to 30. Set hook = true to also
+# accept the project's webhook at /api/hooks/<project> on the dashboard;
+# that needs a token (below, or TINYCD_TOKEN).
 poll = 30
-# hook = "127.0.0.1:8080"
+# hook = true
 
-# Untracked paths every release shares, linked from <root>/shared after sync.
-# A trailing slash creates a missing entry as a directory.
+# How releases run: "process" (default) or "container" (docker, podman, or
+# nerdctl must answer on the host).
+# runtime = "container"
+
+# The port the application listens on. Containers publish it, and every
+# release receives it as PORT.
+port = 3000
+
+# Untracked paths every release shares, linked (or mounted) from
+# <root>/shared after sync. A trailing slash creates a missing entry as a
+# directory.
 # share = ["data/", ".env"]
 
 # Where deployments live; relative paths resolve against this file's
 # directory, so "." keeps them inside .tinycd/. Defaults to <dir>/.tinycd for
-# a Git URL, or ~/.tinycd/<name>-<hash> when tracking a checkout.
+# a Git URL, or <data>/<name>-<hash> when tracking a checkout.
 root = "."
 interlock = "interlock"
 
@@ -32,15 +48,21 @@ start = "npm start"
 
 # Optional deployment gate: a new release must stay up three seconds and pass
 # this command (retried up to 30s) before it replaces the previous release.
-# check = "curl -sf localhost:3000/health"
+# check = "curl -sf localhost:$PORT/health"
+
+# Container runtime only: the base image for the generated Dockerfile
+# (guessed from the project's files by default), or a Dockerfile in the
+# repository to build instead.
+# base = "node:22-slim"
+# dockerfile = "Dockerfile"
 
 # Retain enough releases for quick rollback without filling a home computer.
 keep = 5
 
-# Prefer TINYCD_TOKEN. If stored here, run: chmod 600 config.toml
+# Webhook secret. Prefer TINYCD_TOKEN. If stored here, run: chmod 600 config.toml
 # token = "replace-with-at-least-32-random-ASCII-characters"
 
-# Extra environment for sync, install, and start. Keep this table last:
-# keys below a table header belong to it.
+# Extra environment for sync, install, check, and start. Keep this table
+# last: keys below a table header belong to it.
 # [env]
-# PYTHONPATH = "/home/me/code"
+# NODE_ENV = "production"
