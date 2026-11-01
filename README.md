@@ -320,8 +320,9 @@ the commands instead, or use the container runtime.
 
 ## Deployments
 
-Each project's root on its host — printed at startup and shown in the
-dashboard — is laid out as:
+Each project keeps one release root and runtime; create another project to
+change either after deployment. Its root on the host — printed at startup
+and shown in the dashboard — is laid out as:
 
 ```text
 <root>/

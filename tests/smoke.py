@@ -77,11 +77,12 @@ class Smoke:
         self.bind, self.secure, self.app_port = port(), port(), port()
         self.url = f'http://127.0.0.1:{self.bind}'
         self.token = None
-        self.repo = root / 'repo'
+        self.repo = root / 'My_App.v1'
         self.repo.mkdir()
         self.git('init', '-b', 'main')
         self.git('config', 'user.email', 'smoke@example.invalid')
         self.git('config', 'user.name', 'tinycd smoke')
+        self.git('remote', 'add', 'origin', str(self.repo))
         self.commit('first')
 
     def git(self, *args):
@@ -114,6 +115,7 @@ class Smoke:
         eventually(lambda: (self.data / 'api-token').exists())
         self.token = (self.data / 'api-token').read_text().strip()
         eventually(lambda: self.api('/api/overview')['hosts'][0]['online'])
+        self.hub_process = child
         return child
 
     def api(self, path, body=None, method=None, token=True):
@@ -153,12 +155,17 @@ class Smoke:
         self.git('add', '.')
         self.git('commit', '-m', 'deployment recipe')
         project = self.api('/api/projects', {'id': name, 'repo': str(self.repo), 'host': host,
-                                           'runtime': runtime, 'poll': None})
+                                           'runtime': runtime, 'poll': None, 'share': ['state/']})
+        agent_root = self.data / 'agent' if host == 'local' else self.root / 'agent' / 'agent'
+        shared = agent_root / name / 'shared' / 'state'
+        shared.mkdir(parents=True)
+        (shared / 'persisted').write_text('shared state')
         first = self.deploy(name)['id']
         eventually(lambda: self.body() == 'first')
         self.commit('second')
         second = self.deploy(name)['id']
         eventually(lambda: self.body() == 'second')
+        assert urllib.request.urlopen(f'http://127.0.0.1:{self.app_port}/state/persisted').read() == b'shared state'
         result = self.api(f'/api/projects/{name}/rollback', {'to': first})
         assert result['deployment'] == first
         eventually(lambda: self.project(name)['current'] == first and self.body() == 'first')
@@ -173,9 +180,41 @@ class Smoke:
         eventually(lambda: not self.project(name)['running'])
         self.api(f'/api/projects/{name}/restart', method='POST')
         eventually(lambda: self.project(name)['running'] and self.body() == 'first')
+        if runtime == 'oci':
+            def containers():
+                return subprocess.check_output(['docker', 'ps', '--filter', f'label=tinycd.project={name}',
+                                                '--format', '{{.ID}}'], text=True).strip()
+            before = containers()
+            assert before
+            self.stop(self.hub_process)
+            assert self.body() == 'first'
+            self.hub()
+            eventually(lambda: self.project(name)['running'])
+            assert containers() == before
+            print('PASS running container adopted after hub restart', flush=True)
         self.api(f'/api/projects/{name}?stop=true', method='DELETE')
         eventually(lambda: all(p['id'] != name for p in self.api('/api/overview')['projects']))
-        print(f'PASS {runtime} lifecycle on {host}', flush=True)
+        if runtime == 'oci':
+            eventually(lambda: not containers())
+        print(f'PASS {runtime} lifecycle and shared state on {host}', flush=True)
+
+    def classic(self):
+        marker = self.root / 'classic.pid'
+        cli = self.spawn('classic', '--data', self.data, self.repo, '--poll', '3600',
+                         '--start', f'echo $$ > {marker}; exec sleep 300', '--no-tui')
+        project = eventually(lambda: next((p for p in self.api('/api/overview')['projects']
+                                           if p['name'] == self.repo.name), None))
+        ident = project['id']
+        eventually(lambda: self.project(ident)['running'])
+        self.stop(cli)
+        assert self.project(ident)['running']
+        # cwd resolution must use the same ID, while 0.4's release root
+        # retains its original name and path digest.
+        subprocess.run([str(self.binary), '--data', str(self.data), 'status'], cwd=self.repo,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        assert Path(project['root']).name.startswith('My_App.v1-')
+        self.api(f'/api/projects/{ident}?stop=true', method='DELETE')
+        print('PASS classic CLI with mixed-case/punctuation checkout and retained root', flush=True)
 
     def keep_running(self):
         marker = self.root / 'detached.pid'
@@ -289,6 +328,7 @@ class Smoke:
             raise AssertionError('unauthenticated API succeeded')
         except urllib.error.HTTPError as error:
             assert error.code == 401
+        self.classic()
         self.web_setup()
         self.boundaries()
         self.lifecycle('local', 'process', 'local-app')
@@ -308,7 +348,8 @@ class Smoke:
         self.lifecycle(host, 'process', 'remote-app')
         hub = self.reconcile(hub, agent, host)
         self.stop(agent)
-        agent = self.spawn('agent', '--data', agent_data, 'agent')
+        agent = self.spawn('agent', '--data', agent_data, 'agent',
+                           f'https://127.0.0.1:{self.secure}', '--token', join['token'])
         eventually(lambda: any(h['id'] == host and h['online'] for h in self.api('/api/overview')['hosts']))
         print('PASS hub and agent restart with saved TLS credentials', flush=True)
         self.stop(agent)
@@ -317,7 +358,7 @@ class Smoke:
         if self.oci:
             self.commit('first')
             self.lifecycle('local', 'oci', 'container-app')
-        self.stop(hub)
+        self.stop(self.hub_process)
 
     def close(self):
         for child in reversed(self.children):
@@ -340,8 +381,9 @@ if __name__ == '__main__':
         try:
             smoke.run()
         except BaseException:
-            for log in Path(directory).glob('*.log'):
-                print(f'--- {log.name} ---\n{log.read_text(errors="replace")}')
+            logs = list(Path(directory).glob('*.log')) + list((Path(directory) / 'hub' / 'logs').glob('*/*.log'))
+            for log in logs:
+                print(f'--- {log.relative_to(directory)} ---\n{log.read_text(errors="replace")[-8000:]}')
             raise
         finally:
             smoke.close()

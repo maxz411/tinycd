@@ -109,6 +109,8 @@ commit statuses.
 2. Install the app on the repositories (link shown after creation, and in
    Settings).
 3. Optional: set the public URL in Settings; the webhook is pointed at it.
+   If the app was created without a public URL, also enable Active in its
+   GitHub webhook settings; GitHub's API cannot activate the hook.
    Without one, polling continues and still uses the app's token for private
    repositories.
 

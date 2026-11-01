@@ -436,7 +436,7 @@ async fn resolve_project(client: &Client, wanted: Option<String>) -> Result<Stri
         };
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let key = config::project_key(&cwd);
+        let key = util::slug(&config::project_key(&cwd));
         if ids.contains(&key.as_str()) {
             return Ok(key);
         }
@@ -547,7 +547,7 @@ async fn run_status(data: &std::path::Path, project: Option<String>) -> Result<(
                 Some(wanted) => wanted,
                 None => {
                     let key = std::env::current_dir()
-                        .map(|cwd| config::project_key(&cwd))
+                        .map(|cwd| util::slug(&config::project_key(&cwd)))
                         .unwrap_or_default();
                     if projects.iter().any(|p| p.id == key) {
                         key
@@ -923,6 +923,21 @@ async fn run_agent(data: &std::path::Path, args: AgentArgs) -> Result<(), Error>
     let _lock = store::lock_file(&data.join("agent.lock"))?;
     let saved = link::AgentFile::load(data);
     let file = match (&args.url, &args.token, saved) {
+        (url, _, Some(mut saved))
+            if saved.joined
+                && url
+                    .as_deref()
+                    .is_none_or(|url| url.trim_end_matches('/') == saved.url) =>
+        {
+            // Service/container commands may keep the original one-time
+            // join token in their environment. After joining, always reuse
+            // the permanent credential for the same hub.
+            if let Some(name) = &args.name {
+                saved.name = name.clone();
+            }
+            saved.save(data)?;
+            saved
+        }
         (Some(url), Some(token), _) => {
             let (fingerprint, secret) = link::parse_join_token(token).ok_or(
                 "the token does not look like a tinycd join token (tcj1.<fingerprint>.<secret>)",
@@ -932,6 +947,7 @@ async fn run_agent(data: &std::path::Path, args: AgentArgs) -> Result<(), Error>
                 token: secret,
                 fingerprint,
                 name: args.name.clone().unwrap_or_else(util::hostname),
+                joined: false,
             };
             file.save(data)?;
             file

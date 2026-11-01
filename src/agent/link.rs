@@ -29,6 +29,8 @@ pub struct AgentFile {
     pub token: String,
     pub fingerprint: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub joined: bool,
 }
 
 impl AgentFile {
@@ -105,14 +107,16 @@ pub async fn run_remote(
                                 Some(Ok(Message::Text(text))) => {
                                     match serde_json::from_str::<Envelope<ToAgent>>(&text) {
                                         Ok(envelope) => {
-                                            if let ToAgent::Welcome { token: Some(token), .. } = &envelope.message
-                                                && *token != file.token
-                                            {
-                                                file.token = token.clone();
-                                                if let Err(error) = file.save(&data) {
-                                                    say_err(format!("failed to save the host token: {error}"));
-                                                } else {
-                                                    say("joined the hub; credentials saved");
+                                            if let ToAgent::Welcome { token, .. } = &envelope.message {
+                                                let changed = !file.joined || token.as_ref().is_some_and(|token| *token != file.token);
+                                                if let Some(token) = token { file.token = token.clone(); }
+                                                file.joined = true;
+                                                if changed {
+                                                    if let Err(error) = file.save(&data) {
+                                                        say_err(format!("failed to save the host token: {error}"));
+                                                    } else {
+                                                        say("joined the hub; credentials saved");
+                                                    }
                                                 }
                                             }
                                             agent.handle(envelope.message).await;

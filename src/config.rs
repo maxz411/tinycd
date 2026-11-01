@@ -496,7 +496,7 @@ pub async fn quick_project(args: &QuickArgs, mode: &Mode, data: &Path) -> Result
             .ok_or_else(|| format!("runtime must be process or container, not {text:?}"))?,
     };
 
-    let id = project_key(&dir);
+    let id = util::slug(&project_key(&dir));
     let name = file.name.clone().unwrap_or_else(|| {
         dir.file_name()
             .map(|name| name.to_string_lossy().into_owned())
