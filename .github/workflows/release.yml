@@ -112,3 +112,9 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
+      - name: verify published container binaries
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" "ghcr.io/$GITHUB_REPOSITORY:$RELEASE_TAG" --version |
+              grep --fixed-strings --line-regexp "tinycd ${RELEASE_TAG#v}"
+          done
