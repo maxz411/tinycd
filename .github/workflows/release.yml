@@ -3,12 +3,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag whose container image should be published
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -16,7 +10,6 @@ permissions:
 
 jobs:
   build:
-    if: github.event_name == 'push'
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -63,7 +56,6 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -78,10 +70,9 @@ jobs:
 
   image:
     needs: release
-    if: always() && (github.event_name == 'workflow_dispatch' || needs.release.result == 'success')
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - name: download verified release binaries

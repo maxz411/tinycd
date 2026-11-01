@@ -16,12 +16,7 @@ Per release:
    commit, and push.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow builds
    the binaries and publishes the GitHub release with `.sha256` files.
-   The container image reuses those verified Linux binaries. To retry just
-   container publication for an existing release:
-
-   ```sh
-   gh workflow run release.yml -f tag=vX.Y.Z
-   ```
+   The container image reuses those verified Linux binaries.
 3. `cargo publish`.
 4. Update the tap: copy `homebrew/tinycd.rb` with the new version in the URLs
    and the `sha256` values from the release's `.sha256` assets:
