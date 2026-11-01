@@ -35,3 +35,9 @@ jobs:
           docker compose -f packaging/docker/compose.yml config --quiet
           docker build -f packaging/docker/Dockerfile -t tinycd:check .
           docker run --rm tinycd:check --version
+          check_container=$(docker create tinycd:check)
+          mkdir -p dist/amd64
+          docker cp "$check_container:/usr/local/bin/tinycd" dist/amd64/tinycd
+          docker rm "$check_container"
+          docker build --build-arg BINARY_SOURCE=release -f packaging/docker/Dockerfile -t tinycd:release-check .
+          docker run --rm tinycd:release-check --version
