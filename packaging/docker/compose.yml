@@ -1,0 +1,42 @@
+# tinycd in containers: the dashboard with its own host, running projects
+# through the machine's docker engine. Browse to http://localhost:4000.
+#
+#   docker compose -f packaging/docker/compose.yml up -d
+#
+# Releases run as containers on the same engine, so the dashboard container
+# needs the socket. Mounting it grants the container control of the engine,
+# which is the usual arrangement for tools like this one.
+services:
+  tinycd:
+    image: ghcr.io/maxz411/tinycd:latest
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:4000"
+      - "4443:4443"
+    volumes:
+      # Bind at the same absolute path: child-container mounts are resolved
+      # by the host's Docker daemon, not inside this container.
+      - ${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}:${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TINYCD_HOME: ${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}
+
+  # A second host in its own container, joined to the dashboard above. Set
+  # TINYCD_JOIN_TOKEN from the dashboard's Hosts page, then start it:
+  #   TINYCD_JOIN_TOKEN=tcj1.... docker compose --profile agent up -d agent
+  agent:
+    profiles: ["agent"]
+    image: ghcr.io/maxz411/tinycd:latest
+    restart: unless-stopped
+    command: ["agent", "https://tinycd:4443", "--name", "compose-agent"]
+    environment:
+      TINYCD_HOME: ${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}/remote-host
+      TINYCD_JOIN_TOKEN: ${TINYCD_JOIN_TOKEN:-}
+    volumes:
+      - ${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}/remote-host:${TINYCD_DATA_DIR:-${HOME}/.tinycd-container}/remote-host
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - tinycd

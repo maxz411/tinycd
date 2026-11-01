@@ -1,35 +1,34 @@
-//! The live dashboard shown while the daemon runs on an interactive
-//! terminal: repository and daemon state, retained releases, and the
-//! activity feed that plain mode would print. --no-tui disables it.
+//! The live terminal dashboard: a client of the hub's API, so it attaches
+//! to a hub in this process, in a service, or in a container alike.
+//! Projects, hosts, the releases of one project, and the activity feed.
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::VecDeque, time::Duration};
 
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::unbounded_channel;
 
-use crate::{App, Error, format_age};
+use crate::{
+    client::Client,
+    model::{Event, Overview, Status},
+    util::{Error, age_of},
+};
 
 /// How many activity lines are retained for display.
 const SCROLLBACK: usize = 300;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Redraws per snapshot refresh; the redraw tick drives the animations.
-const TICKS_PER_SNAPSHOT: u64 = 5;
-
-/// Run the dashboard until the user quits with q or Ctrl+C. The terminal is
-/// restored before returning; a return means "shut the daemon down".
-pub async fn dashboard(app: &App, mut lines: UnboundedReceiver<String>) -> Result<(), Error> {
+/// Run the dashboard until the user quits with q or Ctrl+C. With a focus
+/// project, its releases are shown instead of the project list. The
+/// terminal is restored before returning.
+pub async fn dashboard(client: Client, focus: Option<String>, footer: &str) -> Result<(), Error> {
     let (key_tx, mut keys) = unbounded_channel();
     std::thread::spawn(move || {
         while !key_tx.is_closed() {
@@ -42,33 +41,63 @@ pub async fn dashboard(app: &App, mut lines: UnboundedReceiver<String>) -> Resul
         }
     });
 
+    let mut events = client.events(focus.clone());
     let mut terminal = ratatui::init();
     let truecolor = truecolor();
     let mut activity: VecDeque<String> = VecDeque::new();
-    let mut snapshot = Snapshot::read(app).await;
+    let mut overview = client.overview().await.ok();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut frame_count: u64 = 0;
+    let mut dirty = false;
+    let mut lost = false;
 
     let result = loop {
-        while let Ok(line) = lines.try_recv() {
-            push(&mut activity, line);
-        }
-        if let Err(error) =
-            terminal.draw(|frame| draw(frame, app, &snapshot, &activity, frame_count, truecolor))
-        {
+        if let Err(error) = terminal.draw(|frame| {
+            draw(
+                frame,
+                overview.as_ref(),
+                focus.as_deref(),
+                &activity,
+                frame_count,
+                truecolor,
+                footer,
+                lost,
+            )
+        }) {
             break Err(error.into());
         }
 
         tokio::select! {
             _ = tick.tick() => {
                 frame_count += 1;
-                if frame_count.is_multiple_of(TICKS_PER_SNAPSHOT) {
-                    snapshot = Snapshot::read(app).await;
+                if dirty || frame_count.is_multiple_of(30) {
+                    dirty = false;
+                    match client.overview().await {
+                        Ok(fresh) => { overview = Some(fresh); lost = false; }
+                        Err(_) => lost = true,
+                    }
                 }
             }
-            Some(line) = lines.recv() => push(&mut activity, line),
+            event = events.recv() => {
+                match event {
+                    Some(Event::Message { text }) => push(&mut activity, text),
+                    Some(Event::Deployment { deployment }) => {
+                        if !deployment.status.in_progress() || deployment.status == Status::Syncing {
+                            push(&mut activity, format!("{}: {} {}", deployment.project, deployment.id, deployment.status.label()));
+                        }
+                        dirty = true;
+                    }
+                    Some(Event::Host { host, online }) => {
+                        push(&mut activity, format!("host {host} {}", if online { "online" } else { "offline" }));
+                        dirty = true;
+                    }
+                    Some(Event::Log { .. }) => {}
+                    Some(_) => dirty = true,
+                    None => { lost = true; }
+                }
+            }
             Some(event) = keys.recv() => {
-                if let Event::Key(key) = event
+                if let TermEvent::Key(key) = event
                     && key.kind == KeyEventKind::Press
                     && (key.code == KeyCode::Char('q')
                         || (key.code == KeyCode::Char('c')
@@ -87,65 +116,6 @@ fn push(activity: &mut VecDeque<String>, line: String) {
     activity.push_back(line);
     while activity.len() > SCROLLBACK {
         activity.pop_front();
-    }
-}
-
-/// The deployed state as recorded on disk plus whether a server is running.
-struct Snapshot {
-    current: Option<String>,
-    head: Option<String>,
-    server_up: bool,
-    /// Newest first: (id, incomplete).
-    releases: Vec<(String, bool)>,
-}
-
-impl Snapshot {
-    async fn read(app: &App) -> Self {
-        let root = &app.config.root;
-        let current = tokio::fs::canonicalize(root.join("current"))
-            .await
-            .ok()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            });
-        let head = tokio::fs::read_to_string(root.join("head"))
-            .await
-            .ok()
-            .map(|head| head.trim().to_owned())
-            .filter(|head| !head.is_empty());
-        let server_up = app.running.lock().await.server.is_some();
-
-        let mut names = Vec::new();
-        let mut incomplete = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(root.join("deployments")).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(id) = name.strip_prefix(".incomplete-") {
-                    incomplete.push(id.to_owned());
-                } else if !name.starts_with('.')
-                    && entry.file_type().await.is_ok_and(|kind| kind.is_dir())
-                {
-                    names.push(name);
-                }
-            }
-        }
-        names.sort();
-        names.reverse();
-        let releases = names
-            .into_iter()
-            .map(|name| {
-                let building = incomplete.contains(&name);
-                (name, building)
-            })
-            .collect();
-
-        Self {
-            current,
-            head,
-            server_up,
-            releases,
-        }
     }
 }
 
@@ -197,7 +167,7 @@ fn shimmer(index: usize, frame: u64, truecolor: bool) -> Color {
     Color::Rgb((110.0 + x * 120.0) as u8, (220.0 - x * 130.0) as u8, 255)
 }
 
-/// A full-width `── title ────` divider replacing the old box borders.
+/// A full-width `── title ────` divider.
 fn rule(title: &str, width: u16, accent: Color) -> Line<'static> {
     let dash = Style::default().fg(Color::DarkGray);
     let fill = "─".repeat((width as usize).saturating_sub(title.chars().count() + 6));
@@ -212,35 +182,53 @@ fn rule(title: &str, width: u16, accent: Color) -> Line<'static> {
     ])
 }
 
+fn status_style(status: Status) -> Style {
+    match status {
+        Status::Live => Style::default().fg(Color::Green),
+        Status::Failed | Status::Cancelled => Style::default().fg(Color::Red),
+        Status::Retired => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Yellow),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
-    app: &App,
-    snapshot: &Snapshot,
+    overview: Option<&Overview>,
+    focus: Option<&str>,
     activity: &VecDeque<String>,
     tick: u64,
     truecolor: bool,
+    footer: &str,
+    lost: bool,
 ) {
     let width = frame.area().width;
-    let releases_height = snapshot.releases.len().clamp(1, 6) as u16;
+    let spinner = SPINNER[(tick as usize) % SPINNER.len()];
+    let focused = focus.and_then(|id| overview?.projects.iter().find(|p| p.project.id == id));
+
+    let list_len = match (focused, overview) {
+        (Some(view), _) => view.deployments.len(),
+        (None, Some(overview)) => overview.projects.len(),
+        (None, None) => 0,
+    };
+    let list_height = list_len.clamp(1, 8) as u16;
     let [
         header_area,
-        releases_rule_area,
-        releases_area,
+        list_rule_area,
+        list_area,
         activity_rule_area,
         activity_area,
         footer_area,
     ] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(1),
-        Constraint::Length(releases_height),
+        Constraint::Length(list_height),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
-    let config = &app.config;
-    let spinner = SPINNER[(tick as usize) % SPINNER.len()];
     let mut title = vec![Span::styled(
         format!(" {spinner} "),
         Style::default().fg(Color::Magenta),
@@ -253,21 +241,87 @@ fn draw(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    title.push(Span::styled(
-        format!("  {}", config.repo),
-        Style::default().fg(Color::White),
-    ));
-    if let Some(git_ref) = &config.git_ref {
-        title.push(Span::styled(" @ ", Style::default().fg(Color::DarkGray)));
-        title.push(Span::styled(
-            git_ref.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
+    match focused {
+        Some(view) => {
+            title.push(Span::styled(
+                format!("  {}", view.project.repo),
+                Style::default().fg(Color::White),
+            ));
+            if let Some(git_ref) = &view.project.git_ref {
+                title.push(Span::styled(" @ ", Style::default().fg(Color::DarkGray)));
+                title.push(Span::styled(
+                    git_ref.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+        None => {
+            if let Some(overview) = overview {
+                title.push(Span::styled(
+                    format!("  {}", overview.url),
+                    Style::default().fg(Color::White),
+                ));
+            }
+        }
     }
 
     let dot_sep = Span::styled("  ·  ", Style::default().fg(Color::DarkGray));
     let mut state = vec![Span::raw("   ")];
-    if snapshot.server_up {
+    if lost {
+        state.push(Span::styled("●", Style::default().fg(Color::Red)));
+        state.push(Span::styled(
+            " hub unreachable",
+            Style::default().fg(Color::Red),
+        ));
+    } else if let Some(view) = focused {
+        let up = view.project.current.is_some() && view.project.running;
+        if up {
+            state.push(Span::styled(
+                "●",
+                Style::default().fg(glow(
+                    (80, 220, 130),
+                    Color::Green,
+                    Color::LightGreen,
+                    pulse(tick, 20),
+                    truecolor,
+                )),
+            ));
+            state.push(Span::styled(
+                " server up",
+                Style::default().fg(Color::Green),
+            ));
+        } else {
+            state.push(Span::styled("●", Style::default().fg(Color::Red)));
+            state.push(Span::styled(
+                " server down",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if let Some(seconds) = view.project.poll {
+            state.push(dot_sep.clone());
+            state.push(Span::styled(
+                format!("polling every {seconds}s"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if view.project.webhook_token.is_some() {
+            state.push(dot_sep.clone());
+            state.push(Span::styled("webhook on", Style::default().fg(Color::Cyan)));
+        }
+        state.push(dot_sep.clone());
+        state.push(Span::styled(
+            format!("{} on {}", view.project.runtime.label(), view.project.host),
+            Style::default().fg(Color::DarkGray),
+        ));
+        if let Some(root) = &view.project.root {
+            state.push(dot_sep);
+            state.push(Span::styled(
+                format!("root {}", root.display()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else if let Some(overview) = overview {
+        let online = overview.hosts.iter().filter(|h| h.online).count();
         state.push(Span::styled(
             "●",
             Style::default().fg(glow(
@@ -279,100 +333,127 @@ fn draw(
             )),
         ));
         state.push(Span::styled(
-            " server up",
+            format!(" {} of {} hosts online", online, overview.hosts.len()),
             Style::default().fg(Color::Green),
         ));
-    } else {
-        state.push(Span::styled("●", Style::default().fg(Color::Red)));
-        state.push(Span::styled(
-            " server down",
-            Style::default().fg(Color::Red),
-        ));
-    }
-    if let Some(seconds) = config.poll {
         state.push(dot_sep.clone());
         state.push(Span::styled(
-            format!("polling every {seconds}s"),
+            format!("{} projects", overview.projects.len()),
             Style::default().fg(Color::Cyan),
         ));
-    }
-    if let Some(address) = config.hook {
-        state.push(dot_sep.clone());
+        state.push(dot_sep);
         state.push(Span::styled(
-            format!("hook on {address}"),
-            Style::default().fg(Color::Cyan),
+            format!("up {}", age_of(overview.started_at)),
+            Style::default().fg(Color::DarkGray),
         ));
     }
-    state.push(dot_sep);
-    state.push(Span::styled(
-        format!("root {}", config.root.display()),
-        Style::default().fg(Color::DarkGray),
-    ));
 
     let header = Paragraph::new(vec![Line::default(), Line::from(title), Line::from(state)]);
     frame.render_widget(header, header_area);
-    frame.render_widget(
-        Paragraph::new(rule("releases", width, Color::Magenta)),
-        releases_rule_area,
-    );
 
     let mut rows = Vec::new();
-    for (id, building) in snapshot.releases.iter().take(6) {
-        let age = id
-            .parse::<u64>()
-            .ok()
-            .and_then(|millis| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH + Duration::from_millis(millis))
-                    .ok()
-            })
-            .map(|age| format!("{} ago", format_age(age)))
-            .unwrap_or_default();
-        let is_current = snapshot.current.as_deref() == Some(id.as_str());
-        let mut row = Vec::new();
-        if is_current {
-            row.push(Span::styled(
-                " ● ",
-                Style::default().fg(glow(
-                    (90, 200, 255),
-                    Color::Cyan,
-                    Color::LightCyan,
-                    pulse(tick, 24),
-                    truecolor,
-                )),
-            ));
-            row.push(Span::styled(
-                id.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            row.push(Span::styled(
-                format!("  {age}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-            row.push(Span::styled("  current", Style::default().fg(Color::Green)));
-            if let Some(head) = &snapshot.head {
+    match focused {
+        Some(view) => {
+            frame.render_widget(
+                Paragraph::new(rule("releases", width, Color::Magenta)),
+                list_rule_area,
+            );
+            for d in view.deployments.iter().take(8) {
+                let is_current = view.project.current.as_deref() == Some(d.id.as_str());
+                let mut row = Vec::new();
+                if is_current {
+                    row.push(Span::styled(
+                        " ● ",
+                        Style::default().fg(glow(
+                            (90, 200, 255),
+                            Color::Cyan,
+                            Color::LightCyan,
+                            pulse(tick, 24),
+                            truecolor,
+                        )),
+                    ));
+                    row.push(Span::styled(
+                        d.id.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    row.push(Span::raw("   "));
+                    row.push(Span::styled(d.id.clone(), Style::default().fg(Color::Gray)));
+                }
                 row.push(Span::styled(
-                    format!("  {}", &head[..head.len().min(12)]),
-                    Style::default().fg(Color::Yellow),
+                    format!("  {} ago", age_of(d.updated_at)),
+                    Style::default().fg(Color::DarkGray),
                 ));
+                if is_current {
+                    row.push(Span::styled("  current", Style::default().fg(Color::Green)));
+                }
+                if d.status.in_progress() {
+                    row.push(Span::styled(
+                        format!("  {spinner} {}", d.status.label()),
+                        status_style(d.status),
+                    ));
+                } else if d.status != Status::Live {
+                    row.push(Span::styled(
+                        format!("  {}", d.status.label()),
+                        status_style(d.status),
+                    ));
+                }
+                if !d.commit.is_empty() {
+                    row.push(Span::styled(
+                        format!("  {}", &d.commit[..d.commit.len().min(12)]),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                rows.push(Line::from(row));
             }
-        } else {
-            row.push(Span::raw("   "));
-            row.push(Span::styled(id.clone(), Style::default().fg(Color::Gray)));
-            row.push(Span::styled(
-                format!("  {age}"),
-                Style::default().fg(Color::DarkGray),
-            ));
         }
-        if *building {
-            row.push(Span::styled(
-                format!("  {spinner} building"),
-                Style::default().fg(Color::Yellow),
-            ));
+        None => {
+            frame.render_widget(
+                Paragraph::new(rule("projects", width, Color::Magenta)),
+                list_rule_area,
+            );
+            if let Some(overview) = overview {
+                for view in overview.projects.iter().take(8) {
+                    let latest = view.deployments.first();
+                    let up = view.project.current.is_some() && view.project.running;
+                    let mut row = vec![
+                        Span::styled(
+                            if up { " ● " } else { " ○ " },
+                            Style::default().fg(if up { Color::Green } else { Color::Red }),
+                        ),
+                        Span::styled(
+                            view.project.name.clone(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if let Some(d) = latest {
+                        let label = if d.status.in_progress() {
+                            format!("  {spinner} {}", d.status.label())
+                        } else {
+                            format!("  {}", d.status.label())
+                        };
+                        row.push(Span::styled(label, status_style(d.status)));
+                        row.push(Span::styled(
+                            format!("  {} ago", age_of(d.updated_at)),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    row.push(Span::styled(
+                        format!("  {} · {}", view.project.host, view.project.runtime.label()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    row.push(Span::styled(
+                        format!("  {}", view.project.repo),
+                        Style::default().fg(Color::Gray),
+                    ));
+                    rows.push(Line::from(row));
+                }
+            }
         }
-        rows.push(Line::from(row));
     }
     if rows.is_empty() {
         rows.push(Line::styled(
@@ -380,7 +461,7 @@ fn draw(
             Style::default().fg(Color::DarkGray),
         ));
     }
-    frame.render_widget(Paragraph::new(rows), releases_area);
+    frame.render_widget(Paragraph::new(rows), list_area);
 
     frame.render_widget(
         Paragraph::new(rule("activity", width, Color::Magenta)),
@@ -395,15 +476,16 @@ fn draw(
         .map(|(index, line)| {
             let mut style = if line.contains("failed") || line.starts_with("error") {
                 Style::default().fg(Color::Red)
-            } else if line.starts_with("deployed") {
+            } else if line.starts_with("deployed") || line.ends_with(" live") {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
-            } else if line.starts_with("running ") {
+            } else if line.starts_with("running ") || line.contains(": deploying") {
                 Style::default().fg(Color::Yellow)
-            } else if line.starts_with("tracking")
-                || line.starts_with("listening")
-                || line.starts_with("deployments in")
+            } else if line.starts_with("dashboard at")
+                || line.starts_with("project ")
+                || line.starts_with("host ")
+                || line.starts_with("secure listener")
             {
                 Style::default().fg(Color::Cyan)
             } else if line.starts_with("shutting down") {
@@ -425,7 +507,7 @@ fn draw(
 
     frame.render_widget(
         Paragraph::new(Line::styled(
-            " q quit",
+            format!(" {footer}"),
             Style::default().fg(Color::DarkGray),
         )),
         footer_area,
